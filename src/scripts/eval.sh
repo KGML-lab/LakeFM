@@ -138,7 +138,6 @@ cmd=(
   data.ds_plot_id=0
   dataloader.sharding_mode=ddp
   plot_merged=True
-  data.norm_override=True
   plot_interval=True
   num_plot_batches=-1
   forecast_plot_type="line"

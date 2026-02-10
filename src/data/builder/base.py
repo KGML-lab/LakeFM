@@ -8,6 +8,40 @@ from copy import deepcopy
 import copy
 import os
 
+OOD_LAKES = {"BARC", "SUGG", "ME", "GL4", "TOOK", "TR"}
+
+
+def _flatten_maybe_nested_list(x):
+
+    if x is None:
+        return []
+    if isinstance(x, ListConfig):
+        x = list(x)
+    if not isinstance(x, (list, tuple)):
+        return [x]
+    flat = []
+    for item in x:
+        if isinstance(item, ListConfig):
+            item = list(item)
+        if isinstance(item, (list, tuple)):
+            flat.extend(item)
+        else:
+            flat.append(item)
+    return flat
+
+
+def _infer_norm_override_from_lake_ids(lake_ids):
+    """
+    Returns:
+      - True/False when `lake_ids` contains lake-name strings (e.g. ["AL"]).
+      - None when we cannot infer (e.g. numeric ids/ranges or empty).
+    """
+    flat = _flatten_maybe_nested_list(lake_ids)
+    lake_names = [x for x in flat if isinstance(x, str)]
+    if not lake_names:
+        return None
+    return any(name in OOD_LAKES for name in lake_names)
+
 def load_config_from_path(yaml_filename: str, yaml_dir: str):
     # Construct full path
     config_path = os.path.join(yaml_dir, yaml_filename)
@@ -97,8 +131,15 @@ class BaseLakeBuilder():
             cfg = OmegaConf.merge(cfg, overrides)
             cfg["context_len"] = root_cfg["seq_len"]
             cfg["prediction_len"]= root_cfg["pred_len"]
-            
-            builder = instantiate(cfg, base_builder=deepcopy(self))
+
+            base_for_dataset = deepcopy(self)
+            if root_cfg is not None and getattr(root_cfg, "task_name", None) == "evaluate":
+                if base_for_dataset.norm_override in (None, "", "null"):
+                    inferred = _infer_norm_override_from_lake_ids(overrides.get("lake_ids", None))
+                    if inferred is not None:
+                        base_for_dataset.norm_override = inferred
+
+            builder = instantiate(cfg, base_builder=base_for_dataset)
             datasets = builder.load_dataset(prefix=prefix, rank=rank,
                                             world_size=world_size,
                                             sharding_mode=root_cfg.dataloader['sharding_mode'],

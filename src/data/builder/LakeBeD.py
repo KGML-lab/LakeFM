@@ -106,15 +106,25 @@ class LakeBeDBuilder():
             raise ValueError(f"LakeBeDBuilder:: Invalid task name: {self.task_name}")
 
         for i, (raw_id, global_id) in enumerate(tqdm(local_pairs)):
-            save_normalization_file = "LakeBeD_"+str(raw_ids[i])
-            if self.norm_path: #iid sites
+            dataset = id_to_dataset_name[raw_id]
+            canonical_id = None
+            if raw_ids and isinstance(raw_ids[0], int):
+                canonical_id = raw_ids[i]
+            else:
+                lake_names = self.cfg.get("lake_names", None)
+                if lake_names is not None and dataset in lake_names:
+                    canonical_id = list(lake_names).index(dataset) + 1
+                else:
+                    canonical_id = raw_id
+
+            save_normalization_file = "LakeBeD_" + str(canonical_id)
+            if self.norm_path: 
                 normalization_stats_path = osp.join(self.norm_path, save_normalization_file)
-            else: # ood sites
+            else:
                 normalization_stats_path = osp.join(f"{self.server_prefix}/lakefm/dev/norm_stats", "global_variable_stats.json")
-            
-            dataset = id_to_dataset_name[raw_id] 
-            filename = self.cfg[dataset] # AL_NTL
-            lakepath = osp.join(self.root_dir, dataset)#, self.data_split)
+
+            filename = self.cfg[dataset]
+            lakepath = osp.join(self.root_dir, dataset)
             
             # load driver
             driver_df = pd.read_parquet(osp.join(lakepath, filename+self.driver_suffix))
