@@ -12,7 +12,7 @@ project_root/
 │       ├── conf/                   # model and data config yamls
 │       ├── main.py                 # driver script          
 │   ├── data/
-│       ├── builder/                # dataset-speicfic builder classes
+│       ├── builder/                # dataset-specific builder classes
 │       ├── dataset.py              # dataset class for training
 │       ├── eval_dataset.py         # dataset class for evaluation 
 │       ├── loader.py               # loader
@@ -95,3 +95,47 @@ Navigate to the `src/` directory:
 cd src
 ```
 
+Run eval for a lake
+
+```
+bash scripts/driver.sh <run_name> <lake_name>
+```
+`<run_name>` is where the output of the evaluation gets stored (it is the name of the output folder) <br>
+`<lake_name>` lake to be evaluated (e.g. AL, BARC, etc)
+
+Example: 
+```
+bash scripts/driver.sh eval_BARC BARC
+```
+
+1. To run denormalized evaluation,
+
+   ```bash scripts/driver.sh <run_name> <lake_name> --denorm```
+
+2. To generate plots,
+
+   ```bash scripts/driver.sh <run_name> <lake_name> <depth_m> --plot```
+
+   or
+   
+   ```bash scripts/driver.sh <run_name> <lake_name> --plot --depth <depth_m>```
+
+   where `depth_m` is the depth at which to plot
+
+3. To plot for a subset of variables
+
+    ```bash scripts/driver.sh <run_name> <lake_name> <depth_m> --plot --vars '["WaterTemp_C","Water_DO_mg_per_L"]'```
+
+   plots for Water Temp and Water DO
+
+4. To perform variable masking
+
+   ```bash scripts/driver.sh <run_name> <lake_name> --mask-vars '["WaterTemp_C","Chla_ugL"]'```
+
+   masks Water Temp and Chla. To generate plots, pass `--plot` and `--vars` with the list of variables to plot
+
+5. To perform depth masking
+
+   ```bash scripts/driver.sh <run_name> <lake_name> --mask-depths '[1.0,2.0,5.0]'```
+   
+   
