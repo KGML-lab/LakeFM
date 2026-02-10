@@ -5,8 +5,9 @@ eval_dataset="LakeBeD"
 node="${NPROC_PER_NODE:-1}"
 denorm_eval=False
 plot=False
-# If not provided, we plot ALL variables (up to the plotter's max_features).
+
 var_names_subset=null
+depth_name=""
 
 # Masking defaults
 mask_variable=null
@@ -15,7 +16,12 @@ mask_var_across_depths=false
 mask_depth_across_variables=false
 
 usage() {
-  echo "Usage: bash scripts/driver.sh <run_name> <lake_name> <depth_m> [--denorm] [--plot] [--gpus N] [--vars JSON_LIST] [--eval-dataset NAME]"
+  echo "Usage:"
+  echo "  bash scripts/driver.sh <run_name> <lake_name> [depth_m] [--plot] [--depth depth_m] [--denorm] [--gpus N] [--vars JSON_LIST] [--mask-vars JSON_LIST] [--mask-depths JSON_LIST_OR_NUMBER] [--eval-dataset NAME]"
+  echo ""
+  echo "Notes:"
+  echo "  - depth is OPTIONAL for non-plot evaluation."
+  echo "  - If --plot is set, depth MUST be provided (either as 3rd positional arg or via --depth)."
   exit 2
 }
 
@@ -29,6 +35,11 @@ while [[ $# -gt 0 ]]; do
     --plot)
       plot=True
       shift
+      ;;
+    --depth)
+      depth_name="${2:-}"
+      [[ -z "$depth_name" ]] && usage
+      shift 2
       ;;
     --gpus)
       node="${2:-}"
@@ -83,13 +94,22 @@ if [[ $# -gt 0 ]]; then
   positional+=("$@")
 fi
 
-if [[ ${#positional[@]} -lt 3 ]]; then
+if [[ ${#positional[@]} -lt 2 ]]; then
   usage
 fi
 
 run_name="${positional[0]}"
 lake_name="${positional[1]}"
-depth_name="${positional[2]}"
+
+# Optional positional depth (3rd arg)
+if [[ ${#positional[@]} -ge 3 && -z "$depth_name" ]]; then
+  depth_name="${positional[2]}"
+fi
+
+if [[ "$plot" == "True" && -z "$depth_name" ]]; then
+  echo "Error: --plot requires a depth. Provide [depth_m] or --depth <depth_m>."
+  usage
+fi
 
 SERVER_PREFIX="resources"
 CKPT_FOLDER="lakefm/dev/pretrain_ckpts"
@@ -98,38 +118,45 @@ ckpt_name="ckpt"
 CKPT_PATH="${SERVER_PREFIX}/${CKPT_FOLDER}/${ckpt_name}.pth"
 EVAL_OUTPUT_PATH="${SERVER_PREFIX}/${EVAL_OUT_FOLDER}/${ckpt_name}/${eval_dataset}"
 
-torchrun --nproc_per_node=$node -m cli.main -cp conf/pretrain task_name="evaluate" \
-        project_name="lakefm_eval" \
-        run_name=$run_name \
-        server_prefix=$SERVER_PREFIX   \
-        evaluator.eval_dataset=$eval_dataset \
-        model.add_or_concat="concat" \
-        evaluator.ckpt_path=$CKPT_PATH \
-        evaluator.ckpt_name=$ckpt_name \
-        evaluator.num_trials=1 \
-        evaluator.output_dir=$EVAL_OUTPUT_PATH \
-        dataloader.batch_size=32 \
-        dataloader.shuffle=False \
-        data.use_global_lake_filter=true \
-        data.lake_ids="[\"${lake_name}\"]" \
-        data.lake_ids_format=list \
-        model.revin=False \
-        data.ds_plot_id=0 \
-        dataloader.sharding_mode=ddp \
-        plot_merged=True \
-        data.norm_override=True \
-        plot_interval=True \
-        num_plot_batches=-1 \
-        forecast_plot_type="line" \
-        model.variate_wise_df=true \
-        model.shared_variate_embedding_for_df=true \
-        model.num_layers=12 \
-        evaluator.denorm_eval=$denorm_eval \
-        plotter.depth_name=$depth_name \
-        plotter.var_names_subset=$var_names_subset \
-        mask_variable=$mask_variable \
-        mask_depth=$mask_depth \
-        mask_var_across_depths=$mask_var_across_depths \
-        mask_depth_across_variables=$mask_depth_across_variables \
-        evaluator.plot=$plot \
-        dataloader.num_workers=12
+cmd=(
+  torchrun --nproc_per_node="$node" -m cli.main -cp conf/pretrain task_name="evaluate"
+  project_name="lakefm_eval"
+  run_name="$run_name"
+  server_prefix="$SERVER_PREFIX"
+  evaluator.eval_dataset="$eval_dataset"
+  model.add_or_concat="concat"
+  evaluator.ckpt_path="$CKPT_PATH"
+  evaluator.ckpt_name="$ckpt_name"
+  evaluator.num_trials=1
+  evaluator.output_dir="$EVAL_OUTPUT_PATH"
+  dataloader.batch_size=32
+  dataloader.shuffle=False
+  data.use_global_lake_filter=true
+  data.lake_ids="[\"${lake_name}\"]"
+  data.lake_ids_format=list
+  model.revin=False
+  data.ds_plot_id=0
+  dataloader.sharding_mode=ddp
+  plot_merged=True
+  data.norm_override=True
+  plot_interval=True
+  num_plot_batches=-1
+  forecast_plot_type="line"
+  model.variate_wise_df=true
+  model.shared_variate_embedding_for_df=true
+  model.num_layers=12
+  evaluator.denorm_eval="$denorm_eval"
+  plotter.var_names_subset="$var_names_subset"
+  mask_variable="$mask_variable"
+  mask_depth="$mask_depth"
+  mask_var_across_depths="$mask_var_across_depths"
+  mask_depth_across_variables="$mask_depth_across_variables"
+  evaluator.plot="$plot"
+  dataloader.num_workers=12
+)
+
+if [[ -n "$depth_name" ]]; then
+  cmd+=(plotter.depth_name="$depth_name")
+fi
+
+"${cmd[@]}"
