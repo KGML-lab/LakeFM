@@ -1,0 +1,80 @@
+_target_: data.builder.base.BaseLakeBuilder
+dataset_names:
+  - FCR_Simulation_Phy
+  - WQ_Hanson_Simulation
+  - LakeBeD
+
+pretrain_dataset:
+  - FCR_Simulation_Phy
+  - WQ_Hanson_Simulation
+  - LakeBeD
+
+#if a pretrain dataset is passed during pretraining, the model is trained only on that
+#dataset. Else, it will be trained on the entire list of datasets with exisiting checkpoints
+
+var_to_id:
+  WaterTemp_C: 1 # Water_T_C_0.5m
+  SRP_ugL: 2
+  DIN_ugL: 3
+  LightAttenuation_Kd: 4 # Water_Secchi_m = 1.7/LightAttenuation_Kd
+  Chla_ugL: 5
+  AirTemp_C: 6 # mean_Air_Temperature_celsius
+  Shortwave_Wm2: 7 # sum_Shortwave_Radiation_Downwelling_wattPerMeterSquared
+  Inflow_cms: 8
+  sum_Longwave_Radiation_Downwelling_wattPerMeterSquared: 9
+  median_Ten_Meter_Elevation_Wind_Speed_meterPerSecond: 10
+  sum_Precipitation_millimeterPerDay: 11
+  TOC_load_g_per_d: 12
+  TP_load_g_per_d: 13
+  Water_DO_mg_per_L: 14
+  Water_DOC_mg_per_L: 15
+  Water_POC_mg_per_L: 16
+  Water_TP_mg_per_L: 17
+  Water_Secchi_m: 18
+  Discharge_m3_per_d: 19
+  secchi: 18 # lakebed (different datasets have different names for the same variable)
+  temp: 1 # lakebed
+  do: 14 # lakebed
+  inflow: 8 # lakebed
+  par: 20 # lakebed
+  drp: 2 # lakebed
+  tp: 17 # lakebed
+  chla_ugl: 5 # lakebed
+  nh4: 21 # lakebed
+  tn: 22 # lakebed
+  no3no2: 23 # lakebed
+  doc: 15 # lakebed
+
+id_to_var:
+  1: WaterTemp_C
+  2: SRP_ugL
+  3: DIN_ugL
+  4: LightAttenuation_Kd
+  5: Chla_ugL
+  6: AirTemp_C
+  7: Shortwave_Wm2
+  8: Inflow_cms
+  9: sum_Longwave_Radiation_Downwelling_wattPerMeterSquared
+  10: median_Ten_Meter_Elevation_Wind_Speed_meterPerSecond
+  11: sum_Precipitation_millimeterPerDay
+  12: TOC_load_g_per_d
+  13: TP_load_g_per_d
+  14: Water_DO_mg_per_L
+  15: Water_DOC_mg_per_L
+  16: Water_POC_mg_per_L
+  17: Water_TP_mg_per_L
+  18: Water_Secchi_m
+  19: Discharge_m3_per_d
+  20: par
+  21: nh4
+  22: tn
+  23: no3no2
+
+ds_plot_id: 1
+norm_override: 
+global_lake_id_prefix: 0
+
+use_global_lake_filter: false
+
+lake_ids: [101, 203, 305]
+lake_ids_format: explicit

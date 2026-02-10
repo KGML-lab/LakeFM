@@ -1,0 +1,45 @@
+defaults:
+  - data: FCR_Simulation_Phy
+  - model: lakefm_base
+
+# -------- task/meta config --------
+task_name: finetune
+seed: 2025
+pretrain_checkpoints_dir: /raid/lakefm/dev/pretrain_ckpts
+finetune_checkpoints_dir: /raid/lakefm/dev/finetune_ckpts
+output_path: ""
+trial: 0
+
+# -------- training hyperparameters --------
+batch_size: 32
+accum_iter: 1
+weight_decay: 0.01
+lr: 0.0001
+max_epochs: 1
+inverse: false
+
+# -------- eval and visualize config --------
+eval_freq: 2
+plot_ds_id: 1
+plot_freq: 5
+plot_num_samples: 1
+plot_num_windows: 10
+
+# -------- finetune-specific arguments --------
+freeze_encoder: true
+n2one: false
+patience: 3
+pct_start: 0.3
+lradj: type1
+
+# -------- device --------
+device: "3"
+
+# -------- wandb --------
+project_name: lakefm
+run_name: lakefm_run_ft_v0
+save_code: true
+
+# -------- dataset(s) --------
+finetune_dataset_names:
+  - FCR_Simulation_Phytoplanktons

@@ -1,0 +1,57 @@
+_target_: data.builder.WQHansonSim.WQHansonSimBuilder
+
+server_prefix: raid
+root_dir: ${server_prefix}/lakefm/data/WQHanson_Simulation
+norm_path: ${server_prefix}/lakefm/dev/norm_stats
+
+greenlake: greenlake
+mendota: mendota
+prairie: prairie
+trout: trout
+param: parameters_wqhanson_sim.csv
+
+frequency: D
+
+train_fraction: 0.8
+val_fraction: 0.1
+test_fraction: 0.1
+
+# concatdataset or not
+merge: false
+
+# availability of variables
+lake_vars: true
+driver_vars: true
+param_vars: False
+
+vars_2d: ['WaterTemp_C', 'Water_DO_mg_per_L', 'Water_DOC_mg_per_L', 'Water_POC_mg_per_L', 'Water_TP_mg_per_L']
+vars_1d: ['Shortwave_Wm2', 'sum_Longwave_Radiation_Downwelling_wattPerMeterSquared', 'AirTemp_C', 'median_Ten_Meter_Elevation_Wind_Speed_meterPerSecond', 'sum_Precipitation_millimeterPerDay', 'Discharge_m3_per_d', 'TOC_load_g_per_d', 'TP_load_g_per_d', 'Water_Secchi_m']
+
+multi_dataset_file: false
+feature_cols_to_drop:
+  - Lake
+  - Site
+  - DataType
+  - Date
+  - ModelRunType
+  - depth
+
+date_col: Date
+lake_id_col: ''
+depth_col: depth
+
+scale: true
+shuffle: true
+drop_last: true
+
+lake_names: ['greenlake', 'mendota', 'prairie', 'trout']
+lake_ids: ['greenlake', 'mendota', 'prairie', 'trout']
+lake_ids_format: list
+
+mask_variable: null
+mask_depth: null
+mask_var_across_depths: false
+mask_depth_for_all_vars: false
+
+lake_suffix: "_lake.csv"
+driver_suffix: "_driver.csv"

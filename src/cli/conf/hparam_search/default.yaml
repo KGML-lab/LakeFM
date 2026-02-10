@@ -1,0 +1,245 @@
+defaults:
+  - ../pretrain/default  # inherit from pretrain defaults
+  
+seq_pred_combo_default: "42:21"
+patch_size_choices_default: [2, 3, 6] 
+tokenization_choices_default: ["scalar", "patch"] 
+
+# Optimization settings
+optimization:
+  study_name: "lakefm_hparam_search"
+  n_trials: 50
+  direction: "minimize"  # minimize validation loss
+  server_prefix: "/ocean/projects/bio240073p/anujkarpatne/"
+  output_dir: /${optimization.server_prefix}/lakefm/dev/optuna_trials
+  db_name: "lakefm_hparam_search.db"
+  storage: "sqlite:///${optimization.output_dir}/optuna_db/${optimization.db_name}"
+  load_if_exists: true
+
+  # Pruning settings
+  pruner:
+    type: "median"  # median, successive_halving, hyperband
+    n_startup_trials: 10  # Number of trials before pruning starts
+    n_warmup_steps: 30    # Number of epochs before pruning can occur
+    interval_steps: 5     # Check for pruning every N epochs
+  
+  # W&B settings
+  wandb:
+    project: "lakefm_optuna"
+    username: "aneog"  # Replace with your actual W&B username
+    entity: "lakefm"    
+
+# Dataset configuration for this study
+study_dataset:
+  pretrain_dataset: ["WQ_Hanson_Simulation"]  # Specific dataset for this study
+  lake_ids: [1,5]  # Specific lakes for this study
+  lake_ids_format: "range"  # explicit or range
+
+# Base config to load (path to your existing pretrain config)
+base_config:
+  config_path: "cli/conf/pretrain"
+  config_name: "default.yaml"
+
+    
+# Search spaces for hyperparameters
+search_space:
+# Number of layers 
+  - name: "num_layers"
+    path: "model.num_layers"
+    type: "categorical"
+    choices: [2, 3, 4, 6, 8, 10]
+
+    # Encoder number of heads
+  - name: "n_heads"
+    path: "model.n_heads"
+    type: "categorical"
+    choices: [1, 2, 4, 8, 12]
+    
+# Weight decay: covering low to higher regularization
+  - name: "weight_decay"
+    path: "trainer.weight_decay"
+    type: "categorical"
+    choices: [4e-5, 1e-4, 4e-4, 1e-3, 4e-3]
+  
+  - name: "num_warmup_epochs"
+    path: "trainer.num_warmup_epochs"
+    type: "categorical"
+    choices: [10, 20, 25, 30, 40]
+    conditional: "trainer.lr_scheduling_or_not == true"
+
+  - name: "lr_scheduling_or_not"
+    path: "trainer.lr_scheduling_or_not"
+    type: "categorical"
+    choices: [true, false]
+  
+  - name: "lr"
+    path: "trainer.lr"
+    type: "categorical"
+    choices: [1e-4, 1e-5, 5e-5, 5e-4, 3e-4]
+    conditional: "trainer.lr_scheduling_or_not == false"
+
+  # # 2. Learning rate
+  # - name: "lr"
+  #   path: "trainer.lr"
+  #   type: "float"
+  #   low: 1e-5
+  #   high: 1e-3
+  #   log: true
+    
+  # # Weight decay (related to learning rate)
+  # - name: "weight_decay"
+  #   path: "trainer.weight_decay"
+  #   type: "float"
+  #   low: 1e-5
+  #   high: 1e-2
+  #   log: true
+    
+  # 3. Time embedding
+  - name: "use_time_embed"
+    path: "model.use_time_embed"
+    type: "categorical"
+    choices: [true, false]
+    
+
+  # Encoder embedding size (d_model)
+  - name: "d_model"
+    path: "model.d_model"
+    type: "int"
+    low: 64
+    high: 128
+    step: 32
+    # conditional: "model.add_or_concat == 'add'"
+    
+    # Tokenization setting: scalar or patch
+  - name: "tokenization"
+    path: "model.tokenization"
+    type: "categorical"
+    choices: ${tokenization_choices_default}
+
+  #Only if tokenization is 'patch', allow tuning patch_size
+  - name: "patch_size"
+    path: "model.patch_size"
+    type: "categorical"
+    choices: ${patch_size_choices_default}
+    conditional: "model.tokenization == 'patch'"
+
+    # Option for how to combine embeddings
+  - name: "add_or_concat"
+    path: "model.add_or_concat"
+    type: "categorical"
+    choices: ["concat", "add"]
+  
+  - name: "additional_forecast_layer"
+    path: "model.additional_forecast_layer"
+    type: "categorical"
+    choices: [true, false]
+
+  - name: "dropout_p"
+    path: "model.dropout_p"
+    type: "categorical"
+    choices: [0.0, 0.05, 0.2]
+  
+  - name: "attn_dropout_p"
+    path: "model.attn_dropout_p"
+    type: "categorical"
+    choices: [0.0, 0.05, 0.2]
+  
+  - name: "head_dropout"
+    path: "model.head_dropout"
+    type: "categorical"
+    choices: [0.0, 0.02, 0.05, 0.1]
+
+# When using "concat", tune the embedding dimensions
+  - name: "var_embed_dim"
+    path: "model.var_embed_dim"
+    type: "categorical"
+    choices: [64, 128, 256]
+    conditional: "model.add_or_concat == 'concat'"
+
+
+  - name: "depth_embed_dim"
+    path: "model.depth_embed_dim"
+    type: "categorical"
+    choices: [8, 16, 32, 64]
+    conditional: "model.add_or_concat == 'concat'"
+
+  - name: "inp_embed_dim"
+    path: "model.inp_embed_dim"
+    type: "categorical"
+    choices: [8, 16, 32]
+    conditional: "model.add_or_concat == 'concat'"
+
+  - name: "seq_pred_combo"
+    path: "seq_pred_combo"
+    type: "categorical"
+    choices: ["${seq_pred_combo_default}"]
+
+#     # choices: [
+#     #   "21_14",
+#     #   "42_21",   # divisible by 2,3,6,7
+#     #   "84_42",   # divisible by 2,3,4,6,7  
+#     #   # "120_60",  # divisible by 2,3,4,5,6
+#     #   # "210_105", # divisible by 2,3,5,6,7
+#     #   # "420_210"  # divisible by 2,3,4,5,6,7 (LCM of 2,3,4,5,6,7 = 420)
+#     # ]
+    
+  # Contrastive learning settings
+  - name: "use_lake_cl"
+    path: "trainer.use_lake_cl"
+    type: "categorical"
+    choices: [true, false]
+
+  - name: "lake_weight"
+    path: "trainer.lake_weight"
+    type: "categorical"
+    choices: [0.2, 0.4, 0.6, 0.8, 1.0]
+
+  # - name: "lake_weight"
+  #   path: "trainer.lake_weight"
+  #   type: "float"
+  #   low: 0.5
+  #   high: 1.0
+  #   step: 0.1
+ 
+  # - name: "seq_pred_combo"
+  #   path: "seq_pred_combo"
+  #   type: "categorical"
+  #   choices: [
+  #     "42_21",   # divisible by 2,3,6,7
+  #     "84_42",   # divisible by 2,3,4,6,7  
+  #     "120_60",  # divisible by 2,3,4,5,6
+  #     "210_105", # divisible by 2,3,5,6,7
+  #     "420_210"  # divisible by 2,3,4,5,6,7 (LCM of 2,3,4,5,6,7 = 420)
+  #   ]
+
+  # # Variate embedding size
+  # - name: "var_embed_dim"
+  #   path: "model.var_embed_dim"
+  #   type: "int"
+  #   low: 32
+  #   high: 256
+  #   step: 16
+    
+  # # Input token embedding size
+  # - name: "inp_embed_dim"
+  #   path: "model.inp_embed_dim"
+  #   type: "int"
+  #   low: 8
+  #   high: 64
+  #   step: 8
+    
+  # # Depth embedding size
+  # - name: "depth_embed_dim"
+  #   path: "model.depth_embed_dim"
+  #   type: "int"
+  #   low: 8
+  #   high: 128
+  #   step: 8
+
+    
+# Trial resource limits
+resources:
+  max_epochs: 2  # All trials run for 100 epochs unless pruned
+  batch_size: 64   # Smaller batch size for faster trials
+  num_workers: 16   # Reduce workers for resource efficiency
+

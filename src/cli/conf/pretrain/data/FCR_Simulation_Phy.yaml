@@ -1,0 +1,53 @@
+_target_: data.builder.FcrSimPhy.FCRSimPhyBuilder
+
+server_prefix: raid
+root_dir: ${server_prefix}/lakefm/data/FCR_data
+norm_path: ${server_prefix}/lakefm/dev/norm_stats
+
+driver_file: model_runs_driver_data.csv
+params_file: eco-KGML_parameter_scenarios.csv
+lake_data_file: eco-KGML_model_runs.csv
+
+frequency: D
+
+train_fraction: 0.8
+val_fraction: 0.1
+test_fraction: 0.1
+
+# concatdataset or not
+merge: false
+
+# availability of variables
+lake_vars: true
+driver_vars: true
+param_vars: true
+
+vars_2d: ['WaterTemp_C', 'SRP_ugL', 'DIN_ugL', 'LightAttenuation_Kd', 'Chla_ugL']
+vars_1d: ['AirTemp_C', 'Shortwave_Wm2', 'Inflow_cms']
+
+inverse_params : ['R_growth_cyano', 'R_growth_green', 'R_growth_diatom', 'w_p_cyano', 'w_p_green', 'w_p_diatom']
+
+multi_dataset_file: true
+feature_cols_to_drop:
+  - Lake
+  - Site
+  - DataType
+  - DateTime
+  - ModelRunType
+  - Depth_m
+
+date_col: DateTime
+lake_id_col: ModelRunType
+depth_col: Depth_m
+
+scale: true
+shuffle: true
+drop_last: true
+
+mask_variable: ${mask_variable}
+mask_depth: ${mask_depth}
+mask_var_across_depths: ${mask_var_across_depths}
+mask_depth_for_all_vars: ${mask_depth_across_variables}
+
+lake_ids: [1, 1001]
+lake_ids_format: range

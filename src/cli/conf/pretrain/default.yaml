@@ -1,0 +1,209 @@
+defaults:
+  - data: base
+  - model: base_model
+
+tf32: true
+
+# -------- task config --------
+task_name: pretrain
+seed: 2025
+trial: 0
+output_path: ""
+
+# window:
+#   dynamic_windows: true
+#   context_window_range: [21, 30, 42]
+#   pred_window_range: [7, 14, 21]
+
+window:
+  dynamic_windows: false
+  window_pairs: [[14, 14], [21, 14], [30, 14], [30, 21], [30,30]]
+  window_sampling_strategy: "cycle" # random, curriculum
+
+seq_len: 30 # ensure seq len is divisible by model's patch size
+pred_len: 14
+eval_freq: 1 # validation frequency
+
+plot_lake_id: 1 # hard-coded for now. With different lake_ids, code change needed
+plot_freq: 5
+num_plot_batches: 25
+plot_num_samples: 1
+plot_merged: False
+forecast_plot_type: "scatter"
+context_plot_type: "line"
+plot_interval: True
+
+# Regular grid forecasting options
+regular_grid_forecasting: False  # Enable regular grid forecasting for heatmap plotting
+regular_grid_depths: 12  # Number of depth levels for regular grid
+regular_grid_max_depth: null  # Max depth (auto-detect if null)
+enable_heatmap_plotting: True  # Enable heatmap plotting for regular grid data
+plot_both_heatmap_types: True  # Plot both regular and uncertainty heatmaps
+
+# Evaluation time grid selection:
+# - "regular": eval windows indexed over a daily grid (min..max), may be sparse for T+7/T+14/T+21
+# - "irregular": eval windows indexed over observed timestamps (like training), denser horizons
+eval_time_grid: regular
+
+# Lake embedding trajectory extraction
+# When True, extract and save temporal embeddings (after mean pooling) with their corresponding dates
+# for visualizing lake embedding trajectories over time
+lake_embed_traj: false
+
+feature_wise_mse: true
+run_name: lakefm_run_pt_v0
+project_name: lakefm
+server_prefix: raid
+
+PAD_VAL_DEFAULT: 0
+PAD_VAL_ID: 0
+
+# masking params
+mask_variable: []
+mask_depth: []
+mask_var_across_depths: false
+mask_depth_across_variables: false
+
+trainer:
+  device: 3 #auto
+  num_nodes: 1
+  precision: 32
+  wandb_project: ${project_name}
+  wandb_name: ${run_name}
+  save_dir: /${server_prefix}/lakefm/dev/wandb_logs
+  save_code: false
+  
+  scaling: true
+  weight_decay: 4e-4 #4e-3 #0 #1e-2
+  lr: 5e-5 #6e-4 #1e-3 # if using scheduler, current scheduler will naturally warm up to this lr (from 0)
+  beta1: 0.9
+  beta2: 0.98
+  use_lr_scheduler: true
+  warmup_epochs: 
+  optimization_mode: "batch" # epoch/batch
+
+  resume_checkpoint: null
+  pretrain_ckpts_dir: /${server_prefix}/lakefm/dev/pretrain_ckpts
+  
+  # save best ckpt
+  best_ckpt: "ckpt_best.pth"
+  monitor: "val_loss"
+  mode: "min"
+  save_top_k: 1
+  
+  # save last ckpt
+  last_filename: "last_ckpt.pth"
+  save_last: true
+
+  # save ckpt at every N epochs
+  ckpt_filename: "ckpt_epoch{}.pth"
+  save_freq: 5
+  
+  accum_iter: 4 # 1
+  max_epochs: 50
+  inverse: false
+
+  # gradient clipping
+  use_gradient_clipping: true
+  gradient_clip_val: 1.0
+  gradient_clip_algorithm: norm
+
+  lake_weight: 0.8
+  temporal_weight: 0.8
+
+  # contrastive learning
+  use_lake_cl: False
+  use_temporal_cl: False
+  tau_I: 5.0
+  tau_emb: 0.1
+  alpha: 0.6
+  cl_mode: hard # hard/softnegative/hardnegative  
+  
+  #  stabilization parameters
+  cl_adaptive_scaling: true      # Automatically balance CL vs prediction loss
+  cl_warmup_epochs: 3          # Gradual introduction of CL loss
+  cl_ema_momentum: 0.9          # Smooth loss fluctuations
+
+  # regularization for student-t distribution
+  reg_scale_weight: 1e-4
+  reg_df_weight: 1e-4
+  use_log_reg: True
+  df_target: 5.0
+
+dataloader:
+  batch_size: 128
+  plot_batch_size: 32
+  batch_size_factor: 2.0
+  cycle: True
+  num_batches_per_epoch: 16
+  shuffle: True
+  num_workers: 2
+  pin_memory: True
+  drop_last: True
+  fill_last: False
+  worker_init_fn: null
+  prefetch_factor: 4
+  persistent_workers: True
+  sharding_mode: ddp # or dataset -> different datasets across different GPUs; ddp -> batch parallelization
+  P_pos: 4
+
+evaluator:
+  output_dir: /${server_prefix}/lakefm/dev/evaluations/${run_name}
+  ckpt_path:  # either provide a path to a specific checkpoint or checkpoint directory
+  ckpt_name: 
+  which_ckpt: best   # or last
+  num_trials: 5   
+  save_code: true
+  eval_dataset: null
+  data_split: "test"
+  compute_variate_mse: True
+  save_predictions: True
+  denorm_eval: False
+  experiment: False
+  save_per_sample_metrics: True
+  plot: True
+  BL: False
+  bl_start_date: null
+  bl_max_scatter_points: null
+  bl_lake_id: null
+  bl_plot_dates: null
+  thermocline: False
+  thermocline_start_date: null
+  thermocline_end_date: null
+  thermocline_max_depths: null
+  thermocline_depth_round_decimals: 6
+  do_t_plus_n_metrics: False
+
+  t_plus_n_horizons: [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14]
+  
+
+  extract_var_depth_sequences:
+    enabled: true
+    var_name: "WaterTemp_C"  # Variable name from id_to_var
+    depth: 2.5
+
+plotter:
+  plot_type: null
+  h5_path: null
+  mse_range: null
+  mae_range: null
+  lake_ids: null
+  sample_indices: null
+  top_k_mse: 20
+  lowest_mse: True
+  var_name: null
+  target_depth: null
+  var_names_subset: ["WaterTemp_C", "Water_DO_mg_per_L"]
+  depth_index: 1
+  start_date: "2025-01-01"
+  depth_name: 1.5
+  pred_offset: 0.0
+  show_xticks: true
+  show_xlabel: true
+  ymin: null
+  ymax: null
+  axis_label_fontsize: 20
+  tick_labelsize: 20
+  ytick_step: null
+  show_title: true
+  show_ylabel: true
