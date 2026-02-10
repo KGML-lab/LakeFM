@@ -111,10 +111,10 @@ if [[ "$plot" == "True" && -z "$depth_name" ]]; then
   usage
 fi
 
-SERVER_PREFIX="resources"
+SERVER_PREFIX="../resources"
 CKPT_FOLDER="lakefm/dev/pretrain_ckpts"
 EVAL_OUT_FOLDER="lakefm/dev/evaluations"
-ckpt_name="ckpt"
+ckpt_name="lakefm5m"
 CKPT_PATH="${SERVER_PREFIX}/${CKPT_FOLDER}/${ckpt_name}.pth"
 EVAL_OUTPUT_PATH="${SERVER_PREFIX}/${EVAL_OUT_FOLDER}/${ckpt_name}/${eval_dataset}"
 

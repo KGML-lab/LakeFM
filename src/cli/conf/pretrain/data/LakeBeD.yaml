@@ -31,9 +31,9 @@ param: None
 frequency: D
 
 # for evaluating an ood lake, update the split to 6:1:3
-train_fraction: 0.7
+train_fraction: 0.6
 val_fraction: 0.1
-test_fraction: 0.2
+test_fraction: 0.3
 
 # concatdataset or not
 merge: false
