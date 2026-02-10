@@ -101,7 +101,8 @@ Run eval for a lake
 bash scripts/driver.sh <run_name> <lake_name>
 ```
 `<run_name>` is where the output of the evaluation gets stored (it is the name of the output folder) <br>
-`<lake_name>` lake to be evaluated (e.g. AL, BARC, etc)
+`<lake_name>` lake to be evaluated (e.g. AL, BARC, etc) <br>
+**Note:** update the train-val-test split in the `LakeBeD.yaml` `(src/cli/conf/pretrain/data/LakeBeD.yaml)` based on ID or OOD lake evaluation
 
 Example: 
 ```
