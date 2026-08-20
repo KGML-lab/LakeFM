@@ -13,9 +13,6 @@
 #  See the License for the specific language governing permissions and
 #  limitations under the License.
 
-# Modifications Copyright (c) 2026, Abhilash Neog, Virginia Tech.
-# Licensed under the Apache License, Version 2.0.
-
 from collections.abc import Callable
 from functools import partial
 from typing import Optional
@@ -28,6 +25,11 @@ from torch import nn
 from .attention import GroupedQueryAttention
 from .ffn import FeedForward, GatedLinearUnitFeedForward, MoEFeedForward
 from .position import AttentionBias, QueryKeyProjection
+
+def nan_checker_hook(module, inputs, outputs):
+    """A forward hook to check for NaNs in a module's output."""
+    if isinstance(outputs, torch.Tensor) and torch.isnan(outputs).any():
+        print(f"!!!!!!!!!! NaN DETECTED in module: {module.__class__.__name__} !!!!!!!!!!!")
 
 class TransformerEncoderLayer(nn.Module):
     def __init__(
@@ -204,9 +206,12 @@ class TransformerEncoder(nn.Module):
         attn_mask: Optional[Bool[torch.Tensor, "*batch time_len time_len"]] = None,
         var_id: Optional[Int[torch.Tensor, "*batch time_len"]] = None,
         time_id: Optional[Int[torch.Tensor, "*batch time_len"]] = None,
+        padding_mask: Optional[Bool[torch.Tensor, "*batch time_len"]] = None,
     ) -> Float[torch.Tensor, "*batch time_len dim"]:
         for layer in self.layers:
             x = layer(x, attn_mask, var_id=var_id, time_id=time_id)
+            if padding_mask is not None:
+                x = x.masked_fill(~padding_mask.unsqueeze(-1), 0.0)
         return self.norm(x)
 
 
@@ -378,6 +383,7 @@ class TransformerDecoder(nn.Module):
         time_id: Optional[Int[torch.Tensor, "*batch t_len"]] = None,
         mem_var_id: Optional[Int[torch.Tensor, "*batch s_len"]] = None,
         mem_time_id: Optional[Int[torch.Tensor, "*batch s_len"]] = None,
+        tgt_padding_mask: Optional[Bool[torch.Tensor, "*batch t_len"]] = None,
     ) -> Float[torch.Tensor, "*batch t_len dim"]:
         x = tgt
         for layer in self.layers:
@@ -391,4 +397,9 @@ class TransformerDecoder(nn.Module):
                 mem_var_id=mem_var_id,
                 mem_time_id=mem_time_id,
             )
+            # Padded target positions produce NaN from all-masked SDPA rows.
+            # Zero them after each layer so NaN keys don't poison valid
+            # positions in the next layer's Q @ K^T matmul.
+            if tgt_padding_mask is not None:
+                x = x.masked_fill(~tgt_padding_mask.unsqueeze(-1), 0.0)
         return self.norm(x)

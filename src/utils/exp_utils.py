@@ -13,6 +13,10 @@ def print_model_and_data_info(model, datasets, rank=0):
     """
     Print model size and data size information before training.
     
+    Args:
+        model: PyTorch model
+        datasets: Training datasets (list or single dataset)
+        rank: Process rank (only rank 0 prints)
     """
     if rank != 0:
         return

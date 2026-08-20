@@ -152,12 +152,15 @@ def validate_model_dimensions(trial, params):
 
 def apply_hyperparameters_to_config(base_cfg, params, study_cfg):
     """Apply hyperparameters to the base configuration"""
+    # Create a modifiable copy
     trial_cfg = OmegaConf.create(base_cfg)
     
+    # Disable struct mode to allow modifications
     OmegaConf.set_struct(trial_cfg, False)
     
     print(f"Applying hyperparameters: {params}")
     
+    # Apply hyperparameters
     for path, value in params.items():
         try:
             OmegaConf.update(trial_cfg, path, value, merge=True)
@@ -214,6 +217,14 @@ def apply_hyperparameters_to_config(base_cfg, params, study_cfg):
         trial_cfg.model.depth_embed_dim = trial_cfg.model.d_model
         trial_cfg.model.inp_embed_dim = trial_cfg.model.d_model
         print(f"[Add mode] Set all embedding dims to d_model: {trial_cfg.model.d_model}")
+    # elif trial_cfg.model.add_or_concat == "concat":
+    #     # In 'concat' mode, compute d_model as the sum of the three.
+    #     trial_cfg.model.d_model = (
+    #         trial_cfg.model.var_embed_dim +
+    #         trial_cfg.model.depth_embed_dim +
+    #         trial_cfg.model.inp_embed_dim
+    #     )
+    #     print(f"[Concat mode] Computed d_model as sum: {trial_cfg.model.d_model}")
     
     # Apply study-specific dataset configuration
     if hasattr(study_cfg, "study_dataset"):
@@ -283,6 +294,7 @@ def apply_hyperparameters_to_config(base_cfg, params, study_cfg):
 
 def objective(trial, study_cfg, base_cfg):
     """Objective function for Optuna (with DDP init)"""
+    # --- START DDP SETUP ---
     rank = int(os.environ.get("RANK", 0))
     world_size = int(os.environ.get("WORLD_SIZE", 1))
     local_rank = int(os.environ.get("LOCAL_RANK", rank))
@@ -299,6 +311,7 @@ def objective(trial, study_cfg, base_cfg):
     # barrier to sync before trial starts (only if multi-GPU)
     if world_size > 1:
         dist.barrier()
+    # --- END DDP SETUP ---
     
     try:
         # 1) Sample hyperparams
@@ -343,6 +356,10 @@ def objective(trial, study_cfg, base_cfg):
         print(f"trial_cfg.data.lake_ids_format = {trial_cfg.data.lake_ids_format}")
         print(f"trial_cfg.study_dataset = {trial_cfg.study_dataset}")
 
+        # Also add this check to ensure the config is frozen properly:
+        # print(f"Config is frozen: {OmegaConf.is_frozen(trial_cfg)}")
+        # print(f"Config is readonly: {OmegaConf.is_readonly(trial_cfg)}")
+
         print(f"Loading datasets...")
         builder = instantiate(trial_cfg.data)
         datasets, plot_dataset = builder.load_dataset(
@@ -376,6 +393,8 @@ def main(cfg: DictConfig):
     # rank = int(os.environ.get("RANK", 0))
     # world_size = int(os.environ.get("WORLD_SIZE", 1))
     
+    # # Only rank 0 manages the study
+    # if rank == 0:
     logger.info("Starting hyperparameter optimization")
     logger.info(f"Study name: {cfg.optimization.study_name}")
     logger.info(f"Number of trials: {cfg.optimization.n_trials}")

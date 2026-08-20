@@ -7,6 +7,19 @@ from torch.utils.data import Dataset
 from utils.util import Normalizer
 
 class LakeDataset(Dataset):
+    """
+    Updated LakeDataset to handle irregular grid data structure.
+    
+    Key Changes:
+    1. No longer assumes structured data on regular grid
+    2. Handles variable depths per datetime
+    3. Implements (time, variable, depth, value) token structure
+    4. New flattening: v1_d1_sequence -> v1_d2_sequence -> v2_d1_sequence...
+    5. Updated train-test split for datetime-based splitting with variable depths
+    6. Stores corresponding variable and time IDs for each token
+    7. Each token is now (time, depth, variable, value) for consistent embedding
+    8. Tokens are passed as separate lists instead of stacked tensors
+    """
     
     def __init__(self, 
                  lake_df,
@@ -87,35 +100,40 @@ class LakeDataset(Dataset):
 
         self.__process_data__()
         self.__split__()
+        # build_valid_idx is not needed for irregular data
+        # if self.coverage_threshold is not None:
+        #     self.__build_valid_idx__()
     
     def __build_valid_idx__(self):
-        L_ctx, L_pred = self.context_len, self.prediction_len
-        L_total = L_ctx + L_pred
+        """
+        Build valid datetime-window starts for current (context, prediction) lengths.
+        A start index is valid iff BOTH context and prediction windows contain at least
+        one observed lake token (based on datetime_var_depth_map).
+        """
+        L_ctx, L_pred = self.current_context_len, self.current_prediction_len
+        num_dt = len(self.unique_datetimes)
+        num_candidates = num_dt - L_ctx - L_pred + 1
 
-        T = len(self.unique_datetimes)
-        
-        self.valid_idx = []
-        
-        for start_idx in range(T - L_total + 1):
-            window_datetimes = self.unique_datetimes[start_idx:start_idx + L_total]
-            context_datetimes = window_datetimes[:L_ctx]
-            
-            total_tokens = 0
-            available_tokens = 0
-            
-            for dt in context_datetimes:
-                if dt in self.datetime_var_depth_map:
-                    available_tokens += len(self.datetime_var_depth_map[dt])
-                else:
-                    raise ValueError(f"Datetime {dt} not found in datetime_var_depth_map")
-                
-                total_tokens += len(self.variate_ids_2D) * self.num_unique_depths # there is no total tokens for irregular data
-            
-            coverage = available_tokens / total_tokens if total_tokens > 0 else 0
-            if coverage >= self.coverage_threshold:
-                self.valid_idx.append(start_idx)
-        
-        print(f"Built valid_idx with {len(self.valid_idx)} samples (coverage_threshold = {self.coverage_threshold})")
+        if num_candidates <= 0:
+            self.valid_idx = []
+            return
+
+        per_dt_obs = np.array(
+            [len(self.datetime_var_depth_map.get(dt, [])) for dt in self.unique_datetimes],
+            dtype=np.int64,
+        )
+        prefix = np.zeros(num_dt + 1, dtype=np.int64)
+        prefix[1:] = np.cumsum(per_dt_obs)
+
+        valid = []
+        for start_idx in range(num_candidates):
+            ctx_obs = prefix[start_idx + L_ctx] - prefix[start_idx]
+            pred_start = start_idx + L_ctx
+            pred_obs = prefix[pred_start + L_pred] - prefix[pred_start]
+            if ctx_obs > 0 and pred_obs > 0:
+                valid.append(start_idx)
+
+        self.valid_idx = valid
     
     def _create_datetime_var_depth_map(self):
         """
@@ -124,16 +142,19 @@ class LakeDataset(Dataset):
         """
         datetime_map = {}
         
+        # Iterate over the split DataFrame that retains date/depth columns
         for idx, row in self.split_df_lake.iterrows():
             datetime = row[self.date_col]
+            # Datetime is now standardized to YYYY-MM-DD string format
             depth = row[self.depth_col]
             
             if datetime not in datetime_map:
                 datetime_map[datetime] = []
             
+            # Store available variable-depth combinations for this datetime
             for i, var_idx in enumerate(self.variate_ids_2D):
                 var_name = self.var_names_2D[i] if i < len(self.var_names_2D) else None
-                if var_name and not pd.isna(row[var_name]):
+                if var_name and not pd.isna(row[var_name]):  # Only include non-NaN values
                     datetime_map[datetime].append((var_idx, depth, idx))
         
         return datetime_map
@@ -144,7 +165,17 @@ class LakeDataset(Dataset):
         
         For irregular data, we simply extract all available (time, variable, depth, value) 
         combinations that exist in the data, without trying to force a regular grid structure.
-
+        
+        Args:
+            datetimes: List of datetime values to extract data for
+        
+        Returns:
+            values: Flattened tensor of values
+            var_ids: Variable IDs for each token  
+            depth_vals: Depth values for each token
+            time_ids: Relative day indices per token (int)
+            time_values: Normalized day-of-year per token (float)
+            datetime_strs: Raw datetime strings per token (list[str])
         """
         all_values = []
         all_var_ids = []
@@ -159,8 +190,10 @@ class LakeDataset(Dataset):
                 for v_idx, depth, row_idx in self.datetime_var_depth_map[dt]:
                     var_depth_combinations.add((v_idx, depth))
         
+        # Sort combinations for consistent ordering: v1_d1, v1_d2, v1_d3, v2_d1, v2_d2, ...
         var_depth_combinations = sorted(var_depth_combinations, key=lambda x: (x[0], x[1]))
         
+        # Base datetime for relative time id computation
         if base_dt is None:
             base_dt = pd.to_datetime(datetimes[0]) if len(datetimes) > 0 else None
         else:
@@ -198,9 +231,21 @@ class LakeDataset(Dataset):
         time_values_numeric = []
         for dt_str in all_time_values:
             dt = pd.to_datetime(dt_str)
-            day_of_year = dt.dayofyear - 1
-            normalized_day_of_year = day_of_year / 365.25
+            # Use day of year [0-365] instead of days since epoch for better seasonality encoding
+            day_of_year = dt.dayofyear - 1  # 0-indexed (0-364 or 0-365 for leap years)
+            # Normalize to [0, 1] range for numerical stability
+            normalized_day_of_year = day_of_year / 365.25  # 365.25 accounts for leap years
             time_values_numeric.append(normalized_day_of_year)
+        
+        # sanity check
+        if len(all_values) == 0:
+            print(f"Debug: _extract_irregular_data returning empty tensors for datetimes: {datetimes}")
+            print(f"Debug: var_depth_combinations: {var_depth_combinations}")
+            for dt in datetimes:
+                if dt in self.datetime_var_depth_map:
+                    print(f"Debug: {dt} has {len(self.datetime_var_depth_map[dt])} observations")
+                else:
+                    print(f"Debug: {dt} NOT in datetime_var_depth_map")
         
         return (torch.tensor(all_values, dtype=torch.float32),
                 torch.tensor(all_var_ids, dtype=torch.long), 
@@ -321,8 +366,13 @@ class LakeDataset(Dataset):
         unique_dates = self.split_df_lake[self.date_col].unique()
         self.unique_datetimes = sorted(unique_dates)
         self.datetime_var_depth_map = self._create_datetime_var_depth_map()
+        self.__build_valid_idx__()
 
     def _standardize_date_columns(self):
+        """
+        Standardize date columns to datetime type with daily granularity (YYYY-MM-DD format).
+        This ensures consistency across different datasets during pretraining.
+        """
         import pandas as pd
         
         # Standardize lake data date column
@@ -360,6 +410,10 @@ class LakeDataset(Dataset):
         self.max_depth = max(self.depth_values) if len(self.depth_values) > 0 else 1.0
         self.min_depth = min(self.depth_values) if len(self.depth_values) > 0 else 0.0
 
+        # Preserve raw depths for plotting before normalization
+        # self.depth_raw_col = f"{self.depth_col}_raw"
+        # self.lake_df[self.depth_raw_col] = self.lake_df[self.depth_col].copy()
+        # Normalize the depth column in lake_df using min-max scaling
         if self.max_depth > self.min_depth:
             self.lake_df[self.depth_col] = (
                 (self.lake_df[self.depth_col] - self.min_depth) / (self.max_depth - self.min_depth)
@@ -406,8 +460,14 @@ class LakeDataset(Dataset):
         train_data_DR = df_driver[self.border1s_DR[0]:self.border2s_DR[0]]
         train_data_DF = df_lake[self.border1s_DF[0]:self.border2s_DF[0]]
 
-        self.norm.fit_scalers(train_data_DR, train_data_DF)
-        df_driver_scaled, df_lake_scaled = self.norm.transform_data(df_driver, df_lake)
+        use_scaling = self.cfg.get('scaling', True)
+
+        if use_scaling:
+            self.norm.fit_scalers(train_data_DR, train_data_DF)
+            df_driver_scaled, df_lake_scaled = self.norm.transform_data(df_driver, df_lake)
+        else:
+            df_driver_scaled = df_driver.values if hasattr(df_driver, 'values') else df_driver
+            df_lake_scaled = df_lake.values if hasattr(df_lake, 'values') else df_lake
         
         # Convert back to DataFrames and add back metadata columns
         self.df_driver = pd.DataFrame(df_driver_scaled, columns=df_driver.columns)
@@ -417,7 +477,7 @@ class LakeDataset(Dataset):
         self.df_lake[self.date_col] = self.lake_df[self.date_col].values
         self.df_lake[self.depth_col] = self.lake_df[self.depth_col].values
 
-        if self.normalization_stats_path:
+        if use_scaling and self.normalization_stats_path:
             lake_stats_dir = os.path.dirname(self.normalization_stats_path)
             global_stats_path = os.path.join(lake_stats_dir, "global_variable_stats.json")
             
@@ -441,21 +501,20 @@ class LakeDataset(Dataset):
         Each token is now (time, depth, variable, value) for consistent embedding.
         Tokens are passed as separate lists instead of stacked tensors.
         '''
-        # Generate samples based on lake data availability
-        if self.valid_idx is not None:
-            idx = self.valid_idx[idx]
+        if not self.valid_idx:
+            raise RuntimeError("No valid datetime windows available for current context/pred lengths")
 
-        # Use lake datetime indices for context and prediction windows
-        s_begin_lake = idx
+        # Generate samples from precomputed valid starts only
+        s_begin_lake = self.valid_idx[int(idx)]
         s_end_lake = s_begin_lake + self.current_context_len
-        
         r_begin_lake = s_end_lake
         r_end_lake = r_begin_lake + self.current_prediction_len
 
-        # Extract lake data based on datetime windows
         context_datetimes = self.unique_datetimes[s_begin_lake:s_end_lake]
         prediction_datetimes = self.unique_datetimes[r_begin_lake:r_end_lake]
-        
+
+        # Find corresponding driver data indices for these datetimes
+        # Driver data should be available for all lake datetimes (regular data)
         s_begin_DR = s_begin_lake
         s_end_DR = s_end_lake
         r_begin_DR = r_begin_lake
@@ -469,11 +528,11 @@ class LakeDataset(Dataset):
         lake_data_x, lake_var_ids_x, lake_depth_vals_x, lake_time_ids_x, lake_time_values_x, lake_datetime_strs_x = self._extract_irregular_data(
             context_datetimes, base_dt=base_dt_ctx
         )
-        # Get data for prediction period with same base  
+        # Get data for prediction period with same base
         lake_data_y, lake_var_ids_y, lake_depth_vals_y, lake_time_ids_y, lake_time_values_y, lake_datetime_strs_y = self._extract_irregular_data(
             prediction_datetimes, base_dt=base_dt_ctx
-        )   
-        
+        )
+
         date_values_x = self.data_stamp[s_begin_DR:s_end_DR]
         date_values_y = self.data_stamp[r_begin_DR:r_end_DR]
 
@@ -483,13 +542,16 @@ class LakeDataset(Dataset):
             simulation_params = None
 
         # Extract driver variables as surface (depth=0) variables for context only
+        # We don't predict driver variables, only use them as input
         driver_data_x, driver_var_ids_x, driver_depth_vals_x, driver_time_ids_x, driver_time_values_x, driver_datetime_strs_x = self._extract_driver_as_surface_variables(
             driver1D_x, context_datetimes, base_dt=base_dt_ctx
         )
+        # Context: Include both driver (surface) and lake data - drivers first since they're at surface (depth=0)
         flat_seq_x = torch.cat([driver_data_x, lake_data_x])
-        
+
+        # Prediction: Only lake variables (no driver variables to predict)
         flat_seq_y = lake_data_y
-        
+
         var_ids_x = torch.cat([driver_var_ids_x, lake_var_ids_x])
         depth_vals_x = torch.cat([driver_depth_vals_x, lake_depth_vals_x])
         time_values_x = torch.cat([driver_time_values_x, lake_time_values_x])
@@ -502,12 +564,16 @@ class LakeDataset(Dataset):
 
         sample_ids_x, sample_ids_y = self.get_sample_ids(time_ids_x, time_ids_y)
 
+        # Create masks for all observed tokens (both driver and lake)
         flat_mask_x = (~torch.isnan(flat_seq_x)).float()
         flat_mask_y = (~torch.isnan(flat_seq_y)).float()
-        
+
         flat_mask_x = torch.nan_to_num(flat_mask_x).float()
         flat_mask_y = torch.nan_to_num(flat_mask_y).float()
 
+        # Updated masking logic for irregular data structure
+        # TODO: This masking logic needs to be updated for the new irregular structure
+        # For now, we'll skip the complex masking and implement it later if needed
         if self.mask_variable_idx is not None or self.mask_depth is not None:
             print("Warning: Masking logic not yet implemented for irregular data structure")
 
@@ -515,40 +581,35 @@ class LakeDataset(Dataset):
                   "time_values_y": time_values_y,    # Time values (normalized days)
                   "datetime_strs_x": np.array(lake_datetime_strs_x, dtype='datetime64[ns]'), # Raw datetime strings for context tokens
                   "datetime_strs_y": np.array(lake_datetime_strs_y, dtype='datetime64[ns]'), # Raw datetime strings for prediction tokens
-                  "depth_values_x": depth_vals_x,          # Depth values  
-                  "depth_values_y": depth_vals_y,          # Depth values  
+                  "depth_values_x": depth_vals_x,          # Depth values
+                  "depth_values_y": depth_vals_y,          # Depth values
                   "var_ids_x": var_ids_x,                  # Variable IDs
                   "var_ids_y": var_ids_y,                  # Variable IDs
                   "time_ids_x": time_ids_x,
                   "time_ids_y": time_ids_y,
-                  "flat_seq_x": flat_seq_x,
-                  "flat_seq_y": flat_seq_y,
+                  "flat_seq_x": flat_seq_x,            # Uppercase for loader compatibility
+                  "flat_seq_y": flat_seq_y,            # Uppercase for loader compatibility
                   "flat_mask_x": flat_mask_x,
                   "flat_mask_y": flat_mask_y,
                   "lake_id": self.lake_id,
                   "sample_ids_x": sample_ids_x,
                   "sample_ids_y": sample_ids_y,
                   "num2Dvars": len(self.variate_ids_2D),
-                  "num1Dvars": len(self.variate_ids_1D), 
+                  "num1Dvars": len(self.variate_ids_1D),
                   "num_depths": self.num_unique_depths,
                   "lake_name": self.lake_name,
-                  "idx": idx
-                  } 
-        
+                  "idx": s_begin_lake
+                  }
+
         return sample
     
     def __len__(self):
-        max_ctx = max(self.context_window_range)
-        max_pred = max(self.pred_window_range)
-        if self.valid_idx is not None:
-            return max(0, len(self.valid_idx))
-        else:
-            computed_len = len(self.unique_datetimes) - max_ctx - max_pred + 1
-            return max(0, computed_len)
+        return max(0, len(self.valid_idx))
 
     def set_window_lengths(self, context_len: int, prediction_len: int):
         self.current_context_len = int(context_len)
         self.current_prediction_len = int(prediction_len)
+        self.__build_valid_idx__()
 
     def sample_feasible_window(self, rng: np.random.Generator = None, epoch: int = 0):
         """
@@ -581,6 +642,25 @@ class LakeDataset(Dataset):
 
         return int(pairs[idx][0]), int(pairs[idx][1])
 
+        # available = len(self.unique_datetimes)
+        # min_ctx, max_ctx = self.context_window_range
+        # min_pred, max_pred = self.pred_window_range
+        # # clip to feasible maximums given available dates
+        # max_ctx = max(min_ctx, min(max_ctx, available))
+        # max_pred = max(min_pred, min(max_pred, available))
+        # # try a few samples to ensure feasibility
+        # for _ in range(10):
+        #     ctx = int(rng.integers(min_ctx, max_ctx + 1))
+        #     pred = int(rng.integers(min_pred, max_pred + 1))
+        #     if ctx + pred <= available:
+        #         return ctx, pred
+        # # Fallback: shrink to fit
+        # total = min(available, max_ctx + max_pred)
+        # ctx = min(max_ctx, total - min_pred)
+        # pred = total - ctx
+        # ctx = max(ctx, min_ctx)
+        # pred = max(pred, min_pred)
+        # return ctx, pred
     
     def features_processing(self, df):
         
@@ -616,11 +696,18 @@ class LakeDataset(Dataset):
         
         Each time_id=0 indicates the start of a new sample. All tokens with
         time_id=0,1,2,... until the next time_id=0 belong to the same sample.
-    
+        
+        Args:
+            time_ids_x: Time IDs for context tokens
+            time_ids_y: Time IDs for prediction tokens
+            
+        Returns:
+            torch.Tensor: Sample IDs for each token
         """
         sample_ids_x = []
         sample_ids_y = []
         
+        # Process context tokens
         current_sample_id = 1
         for time_id in time_ids_x:
             if time_id == 0:
@@ -628,6 +715,7 @@ class LakeDataset(Dataset):
             sample_ids_x.append(current_sample_id)
         
         # Process prediction tokens
+        # Continue with the same sample ID logic
         for time_id in time_ids_y:
             if time_id == 0:
                 current_sample_id += 1

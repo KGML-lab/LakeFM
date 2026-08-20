@@ -1,0 +1,295 @@
+data:
+  _target_: data.builder.base.BaseLakeBuilder
+  dataset_names:
+  - FCR_Simulation_Phy
+  - WQ_Hanson_Simulation
+  - LakeBeD
+  pretrain_dataset:
+  - FCR_Simulation_Phy
+  - WQ_Hanson_Simulation
+  - LakeBeD
+  var_to_id:
+    WaterTemp_C: 1
+    SRP_ugL: 2
+    DIN_ugL: 3
+    LightAttenuation_Kd: 4
+    Chla_ugL: 5
+    AirTemp_C: 6
+    Shortwave_Wm2: 7
+    Inflow_cms: 8
+    sum_Longwave_Radiation_Downwelling_wattPerMeterSquared: 9
+    median_Ten_Meter_Elevation_Wind_Speed_meterPerSecond: 10
+    sum_Precipitation_millimeterPerDay: 11
+    TOC_load_g_per_d: 12
+    TP_load_g_per_d: 13
+    Water_DO_mg_per_L: 14
+    Water_DOC_mg_per_L: 15
+    Water_POC_mg_per_L: 16
+    Water_TP_mg_per_L: 17
+    Water_Secchi_m: 18
+    Discharge_m3_per_d: 19
+    secchi: 18
+    temp: 1
+    do: 14
+    inflow: 8
+    par: 20
+    drp: 2
+    tp: 17
+    chla_ugl: 5
+    nh4: 21
+    tn: 22
+    no3no2: 23
+    doc: 15
+  id_to_var:
+    1: WaterTemp_C
+    2: SRP_ugL
+    3: DIN_ugL
+    4: LightAttenuation_Kd
+    5: Chla_ugL
+    6: AirTemp_C
+    7: Shortwave_Wm2
+    8: Inflow_cms
+    9: sum_Longwave_Radiation_Downwelling_wattPerMeterSquared
+    10: median_Ten_Meter_Elevation_Wind_Speed_meterPerSecond
+    11: sum_Precipitation_millimeterPerDay
+    12: TOC_load_g_per_d
+    13: TP_load_g_per_d
+    14: Water_DO_mg_per_L
+    15: Water_DOC_mg_per_L
+    16: Water_POC_mg_per_L
+    17: Water_TP_mg_per_L
+    18: Water_Secchi_m
+    19: Discharge_m3_per_d
+    20: par
+    21: nh4
+    22: tn
+    23: no3no2
+  ds_plot_id: 0
+  norm_override: null
+  global_lake_id_prefix: 0
+  use_global_lake_filter: true
+  lake_ids:
+  - AL
+  lake_ids_format: list
+model:
+  _target_: lakefm.model.LakeFMModule
+  model_name: lakefm
+  d_model: 128
+  num_layers: 12
+  n_heads: 4
+  var_embed_dim: 64
+  depth_embed_dim: 32
+  inp_embed_dim: 64
+  time_embed_dim: 16
+  static_dim: 32
+  temporal_dim: 96
+  output_attention: false
+  factor: 1
+  dropout_p: 0.0
+  head_dropout: 0.02
+  d_ff: 2048
+  attn_dropout_p: 0.0
+  activation: swiglu
+  revin: false
+  tokenization: scalar
+  patch_size: 3
+  max_vars: 24
+  pad_token: 0
+  max_seq_len: 3076
+  max_pred_len: 588
+  seq_len: ${seq_len}
+  pred_len: ${pred_len}
+  add_or_concat: concat
+  additional_forecast_layer: true
+  num_bands: 6
+  max_resolution: 1.0
+  include_input: true
+  use_rope: true
+  cl_proj_type: attention_pooling
+  cl_proj_dim: 64
+  use_time_embed: true
+  use_pre_norm: true
+  variate_wise_df: true
+  shared_variate_embedding_for_df: true
+  stop_grad_on_shared_var_embed_for_df: true
+  num_warmup_steps: 10000
+tf32: true
+task_name: evaluate
+seed: 2025
+trial: 0
+output_path: ''
+window:
+  dynamic_windows: false
+  window_pairs:
+  - - 14
+    - 14
+  - - 21
+    - 14
+  - - 30
+    - 14
+  - - 30
+    - 21
+  - - 30
+    - 30
+  window_sampling_strategy: cycle
+seq_len: 30
+pred_len: 14
+eval_freq: 1
+plot_lake_id: 1
+plot_freq: 5
+num_plot_batches: -1
+plot_num_samples: 1
+plot_merged: true
+forecast_plot_type: line
+context_plot_type: line
+plot_interval: true
+regular_grid_forecasting: false
+regular_grid_depths: 12
+regular_grid_max_depth: null
+enable_heatmap_plotting: true
+plot_both_heatmap_types: true
+eval_time_grid: regular
+lake_embed_traj: false
+feature_wise_mse: true
+run_name: test
+project_name: lakefm_eval
+server_prefix: ../resources
+PAD_VAL_DEFAULT: 0
+PAD_VAL_ID: 0
+mask_variable: null
+mask_depth: null
+mask_var_across_depths: false
+mask_depth_across_variables: false
+trainer:
+  device: 3
+  num_nodes: 1
+  precision: 32
+  wandb_project: ${project_name}
+  wandb_name: ${run_name}
+  save_dir: /${server_prefix}/lakefm/dev/wandb_logs
+  save_code: false
+  scaling: true
+  weight_decay: 0.0004
+  lr: 5.0e-05
+  beta1: 0.9
+  beta2: 0.98
+  use_lr_scheduler: true
+  warmup_epochs: null
+  optimization_mode: batch
+  resume_checkpoint: null
+  pretrain_ckpts_dir: /${server_prefix}/lakefm/dev/pretrain_ckpts
+  best_ckpt: ckpt_best.pth
+  monitor: val_loss
+  mode: min
+  save_top_k: 1
+  last_filename: last_ckpt.pth
+  save_last: true
+  ckpt_filename: ckpt_epoch{}.pth
+  save_freq: 5
+  accum_iter: 4
+  max_epochs: 50
+  inverse: false
+  use_gradient_clipping: true
+  gradient_clip_val: 1.0
+  gradient_clip_algorithm: norm
+  lake_weight: 0.8
+  temporal_weight: 0.8
+  use_lake_cl: false
+  use_temporal_cl: false
+  tau_I: 5.0
+  tau_emb: 0.1
+  alpha: 0.6
+  cl_mode: hard
+  cl_adaptive_scaling: true
+  cl_warmup_epochs: 3
+  cl_ema_momentum: 0.9
+  reg_scale_weight: 0.0001
+  reg_df_weight: 0.0001
+  use_log_reg: true
+  df_target: 5.0
+dataloader:
+  batch_size: 32
+  plot_batch_size: 32
+  batch_size_factor: 2.0
+  cycle: true
+  num_batches_per_epoch: 16
+  shuffle: false
+  num_workers: 12
+  pin_memory: true
+  drop_last: true
+  fill_last: false
+  worker_init_fn: null
+  prefetch_factor: 4
+  persistent_workers: true
+  sharding_mode: ddp
+  P_pos: 4
+evaluator:
+  output_dir: ../resources/lakefm/dev/evaluations/lakefm5m/LakeBeD
+  ckpt_path: ../resources/lakefm/dev/pretrain_ckpts/lakefm5m.pth
+  ckpt_name: lakefm5m
+  which_ckpt: best
+  num_trials: 1
+  save_code: true
+  eval_dataset: LakeBeD
+  data_split: test
+  compute_variate_mse: true
+  save_predictions: true
+  denorm_eval: false
+  experiment: false
+  save_per_sample_metrics: true
+  plot: false
+  BL: false
+  bl_start_date: null
+  bl_max_scatter_points: null
+  bl_lake_id: null
+  bl_plot_dates: null
+  thermocline: false
+  thermocline_start_date: null
+  thermocline_end_date: null
+  thermocline_max_depths: null
+  thermocline_depth_round_decimals: 6
+  do_t_plus_n_metrics: false
+  t_plus_n_horizons:
+  - 1
+  - 2
+  - 3
+  - 4
+  - 5
+  - 6
+  - 7
+  - 8
+  - 9
+  - 10
+  - 11
+  - 12
+  - 13
+  - 14
+  extract_var_depth_sequences:
+    enabled: true
+    var_name: WaterTemp_C
+    depth: 2.5
+plotter:
+  plot_type: null
+  h5_path: null
+  mse_range: null
+  mae_range: null
+  lake_ids: null
+  sample_indices: null
+  top_k_mse: 20
+  lowest_mse: true
+  var_name: null
+  target_depth: null
+  var_names_subset: null
+  depth_index: 1
+  start_date: '2025-01-01'
+  depth_name: 1.5
+  pred_offset: 0.0
+  show_xticks: true
+  show_xlabel: true
+  ymin: null
+  ymax: null
+  axis_label_fontsize: 20
+  tick_labelsize: 20
+  ytick_step: null
+  show_title: true
+  show_ylabel: true

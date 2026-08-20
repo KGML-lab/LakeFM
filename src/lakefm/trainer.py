@@ -29,6 +29,19 @@ from utils.exp_utils import print_model_and_data_info
 
 
 def check_contrastive_batch_stats(batch, p_pos, print_freq=100, batch_idx=0):
+    """
+    Performs a sanity check on a batch for contrastive learning.
+
+    Calculates and prints the number of positive and negative pairs based on 'lake_id'.
+    A "positive pair" is two samples from the same lake.
+    A "negative pair" is two samples from different lakes.
+
+    Args:
+        batch (dict): The batch dictionary from the DataLoader. Must contain 'lake_id'.
+        p_pos (int): The expected number of samples per lake (P_pos from your config).
+        print_freq (int): How often to print the stats (e.g., every 100 batches).
+        batch_idx (int): The current batch index.
+    """
     if batch_idx % print_freq != 0:
         return
 
@@ -43,13 +56,16 @@ def check_contrastive_batch_stats(batch, p_pos, print_freq=100, batch_idx=0):
     batch_size = len(lake_ids)
     counts = Counter(lake_ids)
 
+    # --- Calculate pairs ---
     positive_pairs = 0
     for count in counts.values():
+        # For a group of 'n' items, the number of pairs is n * (n-1) / 2
         positive_pairs += count * (count - 1) // 2
 
     total_possible_pairs = batch_size * (batch_size - 1) // 2
     negative_pairs = total_possible_pairs - positive_pairs
 
+    # --- Print Statistics ---
     print("\n" + "="*50)
     print(f"[Contrastive Batch Sanity Check at Batch {batch_idx}]")
     print(f"  - Batch Size: {batch_size}")
@@ -133,6 +149,9 @@ class Trainer():
         self.cl_mode = self.trainer.cl_mode
 
         self.device = f"cuda:{self.rank}" #self.trainer.device
+        model_ref = self.model.module if hasattr(self.model, "module") else self.model
+        self.total_params = sum(p.numel() for p in model_ref.parameters())
+        self.trainable_params = sum(p.numel() for p in model_ref.parameters() if p.requires_grad)
 
         self.plotter = Plotter(self.device, self.pad_value_default)
         self.irregular_plotter = IrregularGridPlotter(self.device, self.pad_value_default)
@@ -143,7 +162,17 @@ class Trainer():
         self.cl_ema_momentum = getattr(self.trainer, 'cl_ema_momentum', 0.9)
 
     def compute_nll_loss(self, forecasts, targets, mask=None):
-
+        """
+        Compute Negative Log Likelihood loss for Student-t distribution.
+        
+        Args:
+            forecasts: Dict with 'distribution' key containing StudentT distribution
+            targets: Ground truth values (B, S_t)
+            mask: Optional mask for valid predictions (B, S_t)
+            
+        Returns:
+            NLL loss
+        """
         if isinstance(forecasts, dict) and 'distribution' in forecasts:
             # Probabilistic forecasting case
             distribution = forecasts['distribution']
@@ -221,10 +250,12 @@ class Trainer():
         lake_ids = torch.tensor(lake_ids, device=z.device)
         same = lake_ids[:, None].eq(lake_ids[None, :])  # (B,B)
         
+        # --- build weight matrix w --------------------------------------
         if self.cl_mode == "hard":                            # hard CL 
             w = same.float()
         else:                                      # soft core
             dtw_matrix = self.dtw.get_dtw_matrix(global_idx, raw_window)
+            # Convert distances to similarities with a temperature; ensure shape (B,B)
             w = 2 * self.trainer.alpha * torch.sigmoid(-self.trainer.tau_I * dtw_matrix)
             if self.cl_mode == "hardnegative":                        # hard negatives
                 w.masked_fill_(~same, 1.0)
@@ -248,17 +279,17 @@ class Trainer():
         # Use NLL loss for probabilistic forecasting, MSE for fallback
         forecasting_loss = self.compute_nll_loss(forecasts=pred, targets=seq_Y, mask=mask_out)
 
-        # Add Student-t parameter regularizers if probabilistic forecasting
+        # Add distribution parameter regularizers if probabilistic forecasting
         reg_loss = 0.0
-        if isinstance(pred, dict) and 'scale' in pred and 'df' in pred:
+        if isinstance(pred, dict) and 'scale' in pred:
             scale = pred['scale']  # (B, S_t)
-            df = pred['df']  # (B, S_t)
+            df = pred.get('df', None)  # (B, S_t) or None
             
 
             # Apply mask to parameters if available
             if mask_out is not None:
                 valid_scale = scale[mask_out.bool()]
-                valid_df = df[mask_out.bool()]
+                valid_df = df[mask_out.bool()] if df is not None else None
             else:
                 valid_scale = scale
                 valid_df = df
@@ -273,24 +304,34 @@ class Trainer():
                 reg_loss += reg_scale
             
 
-            # Degrees of freedom regularization: L2 on (df - df_target) or log(df)
-            reg_df_weight = getattr(self.trainer, 'reg_df_weight', 1e-4)
-            df_target = getattr(self.trainer, 'df_target', 5.0)  # Target df (default 5)
+            # Degrees of freedom regularization (Student-t only)
+            if df is not None:
+                reg_df_weight = getattr(self.trainer, 'reg_df_weight', 1e-4)
+                df_target = getattr(self.trainer, 'df_target', 5.0)  # Target df (default 5)
+                if reg_df_weight > 0:
+                    if not getattr(self.trainer, 'use_log_reg', True):
+                        # Regularize log(df) - ensure df values are positive
+                        valid_df_safe = torch.clamp(valid_df, min=1e-6)
+                        reg_df = reg_df_weight * torch.mean(torch.log(valid_df_safe) ** 2)
+                    else:
+                        # Regularize (df - df_target)
+                        reg_df = reg_df_weight * torch.mean((valid_df - df_target) ** 2)
+                    reg_loss += reg_df
             
-            if reg_df_weight > 0:
-                if not getattr(self.trainer, 'use_log_reg', True):
-                    valid_df_safe = torch.clamp(valid_df, min=1e-6)
-                    reg_df = reg_df_weight * torch.mean(torch.log(valid_df_safe) ** 2)
-                else:
-                    reg_df = reg_df_weight * torch.mean((valid_df - df_target) ** 2)
-                reg_loss += reg_df
-            
+            # Log parameter statistics for monitoring
             if self.rank == 0 and hasattr(self, 'step_count'):
                 if self.step_count % 50 == 0:  # Log every 50 steps
                     mean_scale = torch.mean(valid_scale).item()
-                    mean_df = torch.mean(valid_df).item()
-                    print(f"Step {self.step_count}: mean_scale={mean_scale:.4f}, mean_df={mean_df:.4f}")
+                    if valid_df is not None:
+                        mean_df = torch.mean(valid_df).item()
+                        print(f"Step {self.step_count}: mean_scale={mean_scale:.4f}, mean_df={mean_df:.4f}")
+                    else:
+                        print(f"Step {self.step_count}: mean_scale={mean_scale:.4f}")
         
+        # Log forecasting and regularization losses (only from rank 0)
+        # if self.rank == 0:
+        #     print(f"Loss components - forecasting_loss: {forecasting_loss.item():.6f}, reg_loss: {reg_loss:.6f}")
+        # Add regularization to forecasting loss
         forecasting_loss = forecasting_loss + reg_loss
 
         if self.use_lake_cl:
@@ -300,20 +341,27 @@ class Trainer():
                                         global_idx=global_idx,
                                         raw_window=raw_window
                                         )
+            # cl_loss_term = self.trainer.lake_weight * lake_cl_loss
+            # Apply exponential moving average for smoothing
             if self.cl_loss_ema is None:
                 self.cl_loss_ema = lake_cl_loss.item()
             else:
                 self.cl_loss_ema = self.cl_ema_momentum * self.cl_loss_ema + (1 - self.cl_ema_momentum) * lake_cl_loss.item()
             
+            # Get warmup weight for stability
             warmup_weight = self.get_cl_warmup_weight(epoch)
 
+            # Use EMA (if enabled) to stabilize adaptive scaling
             use_ema = getattr(self.trainer, 'cl_use_ema_for_weighting', True)
             cl_ref_mag = (self.cl_loss_ema if (use_ema and self.cl_loss_ema is not None)
                           else lake_cl_loss.item())
 
+            # Adaptive scaling based on ratio of losses
             loss_ratio = forecasting_loss.item() / (cl_ref_mag + 1e-8)
             adaptive_weight = self.trainer.lake_weight * min(1.0, loss_ratio * 0.1)  # Cap the weight
             
+            # Alternative: Use a more stable scaling approach
+            # Scale contrastive loss to be proportional to forecasting loss
             if hasattr(self.trainer, 'cl_adaptive_scaling') and self.trainer.cl_adaptive_scaling:
                 target_cl_magnitude = forecasting_loss.item() * 0.5  # Target CL to be 50% of forecast loss
                 current_cl_magnitude = cl_ref_mag
@@ -329,6 +377,7 @@ class Trainer():
             final_weight = adaptive_weight * warmup_weight
             cl_loss_term = final_weight * lake_cl_loss
             
+            # Return contrastive learning components for epoch-level logging
             cl_components = {
                 'lake_cl_loss': lake_cl_loss.item(),
                 'adaptive_weight': adaptive_weight,
@@ -352,10 +401,21 @@ class Trainer():
         return avg_batch_loss_global
 
     def _pad_and_concat_tensors(self, tensor_list, pad_value=0.0):
-
+        """
+        Helper function to pad tensors to the same length and concatenate them.
+        Only pads if necessary (when tensors have different sequence lengths).
+        
+        Args:
+            tensor_list: List of tensors to concatenate
+            pad_value: Value to use for padding (default: 0.0)
+            
+        Returns:
+            Concatenated tensor with all inputs padded to the same length
+        """
         if not tensor_list:
             return None
             
+        # Check if all tensors have the same sequence length
         seq_lengths = [t.shape[1] for t in tensor_list]
         if len(set(seq_lengths)) == 1:
             # All tensors have the same length, no padding needed
@@ -369,7 +429,9 @@ class Trainer():
         for t in tensor_list:
             if t.shape[1] < max_seq_len:
                 pad_size = max_seq_len - t.shape[1]
+                # Handle both 2D and 3D tensors
                 if len(t.shape) == 2:
+                    # 2D tensor: (batch_size, sequence_length)
                     padding = torch.full((t.shape[0], pad_size), pad_value,
                                        device=t.device, dtype=t.dtype)
                 else:
@@ -383,6 +445,16 @@ class Trainer():
         return torch.cat(padded_tensors, dim=0)
 
     def _pad_and_concat_numpy_arrays(self, array_list, pad_value=''):
+        """
+        Pad numpy arrays to the same sequence length and concatenate them.
+        
+        Args:
+            array_list: List of numpy arrays to pad and concatenate
+            pad_value: Value to use for padding (default: empty string for datetime strings)
+            
+        Returns:
+            Concatenated array with all arrays padded to the same length
+        """
         if not array_list:
             return np.array([])
         
@@ -400,9 +472,12 @@ class Trainer():
         for arr in array_list:
             if arr.shape[1] < max_seq_len:
                 pad_size = max_seq_len - arr.shape[1]
+                # Handle both 2D and 3D arrays
                 if len(arr.shape) == 2:
+                    # 2D array: (batch_size, sequence_length)
                     padding = np.full((arr.shape[0], pad_size), pad_value, dtype=arr.dtype)
                 else:
+                    # 3D array: (batch_size, sequence_length, features)
                     padding = np.full((arr.shape[0], pad_size, arr.shape[2]), pad_value, dtype=arr.dtype)
                 padded_arrays.append(np.concatenate([arr, padding], axis=1))
             else:
@@ -414,6 +489,7 @@ class Trainer():
         
         num_plot_batches=self.cfg.num_plot_batches
 
+        # Plot-only accumulators can get very large; only allocate them when plotting is enabled.
         if plot and self.rank == 0:
             var_ids_2d_list = []
             depth_val_list = []
@@ -441,6 +517,7 @@ class Trainer():
         batch_df_sum = 0.0
         batch_df_count = 0
 
+        # Metric accumulators (sum over tokens); we'll divide by count after all-reduce
         mse_sum = 0.0
         mae_sum = 0.0
         crps_sum = 0.0
@@ -463,6 +540,8 @@ class Trainer():
             pbar=tqdm(total=len(dataloader), desc=f'Epoch {epoch + 1}/{self.max_epochs}', unit='batch')
 
         for iteration, sample in enumerate(dataloader):
+            # if iteration==len(dataloader)//2:
+            #     break
             seq_X = sample["flat_seq_x"].to(self.device)
             mask_X = sample["flat_mask_x"].to(self.device) 
             sample_ids_x = sample["sample_ids_x"].to(self.device) 
@@ -472,13 +551,14 @@ class Trainer():
             depth_values_x = sample["depth_values_x"].to(self.device)
             time_values_x = sample["time_values_x"].to(self.device)
             
-            lake_ids = sample["lake_id"] 
+            lake_ids = sample["lake_id"] # lake id of each lake in batch
             lake_names = sample["lake_name"]
             idx = sample["idx"]
             num_2d_vars = sample['num2Dvars']
             num_1d_vars = sample['num1Dvars']
             num_depths = sample['num_depths']
 
+            # target data
             seq_Y = sample["flat_seq_y"].to(self.device)
             mask_Y = sample["flat_mask_y"].to(self.device)
             sample_ids_y = sample["sample_ids_y"].to(self.device)
@@ -494,8 +574,9 @@ class Trainer():
                                         pred_len=self.pred_len,
                                         seq_len=self.seq_len)
 
+            # During plotting, avoid DDP collectives by calling the underlying module directly
             model_ref = self.model.module if (plot and hasattr(self.model, "module")) else self.model
-            with torch.autocast(device_type='cuda'):
+            with torch.inference_mode(), torch.autocast(device_type='cuda'):
                 x_enc, pred, z = model_ref(data=seq_X,
                                              observed_mask=mask_X,
                                              sample_ids=sample_ids_x,
@@ -527,8 +608,10 @@ class Trainer():
 
                     batch_pred_loss += pred_loss.item()
 
+                    # ---------------- Metrics: MSE, MAE, CRPS ----------------
                     with torch.no_grad():
                         valid_mask_bool = mask_out.bool()
+                        # prediction mean
                         if isinstance(pred, dict) and 'distribution' in pred:
                             pred_mean_tensor = pred['distribution'].mean
                             dist_obj = pred['distribution']
@@ -543,6 +626,7 @@ class Trainer():
                             mae_sum += F.l1_loss(yhat_valid, y_valid, reduction='sum').item()
                             metric_count += y_valid.numel()
 
+                        # CRPS Monte Carlo estimate if distribution present
                         if dist_obj is not None and y_valid.numel() > 0:
                             K = 16
                             try:
@@ -564,21 +648,27 @@ class Trainer():
                     if lake_contrastive_loss:
                         batch_lake_contrastive_loss += lake_contrastive_loss
 
+                    # Track distribution parameters if available
                     if isinstance(pred, dict) and 'df' in pred:
                         valid_df = pred['df'][mask_out.bool()]
                         if len(valid_df) > 0:
                             batch_df_sum += valid_df.sum().item()
                             batch_df_count += len(valid_df)
+                    # Track variate-wise base df if available
                     if isinstance(pred, dict) and 'df_base' in pred:
                         valid_df_base = pred['df_base'][mask_out.bool()].float()
                         valid_var_ids = var_ids_y[mask_out.bool()].long()
                         if len(valid_df_base) > 0:
+                            # determine global variate vocabulary size once
                             if global_num_variates is None:
                                 try:
+                                    # id_to_var keys may be strings in config; cast to int
                                     global_num_variates = max(int(k) for k in self.data.id_to_var.keys()) + 1
                                 except Exception:
+                                    # Fallback to current batch max if mapping not available
                                     global_num_variates = valid_var_ids.max().item() + 1
 
+                            # Initialize or grow accumulators as needed
                             if batch_df_base_sums is None:
                                 batch_df_base_sums = torch.zeros(global_num_variates, device=self.device, dtype=torch.float32)
                                 batch_df_base_counts = torch.zeros_like(batch_df_base_sums)
@@ -586,6 +676,7 @@ class Trainer():
                                 current_size = batch_df_base_sums.numel()
                                 need_size = max(global_num_variates, (valid_var_ids.max().item() + 1))
                                 if need_size > current_size:
+                                    # Grow tensors to accommodate larger variate ids
                                     new_sums = torch.zeros(need_size, device=self.device, dtype=batch_df_base_sums.dtype)
                                     new_counts = torch.zeros(need_size, device=self.device, dtype=batch_df_base_counts.dtype)
                                     new_sums[:current_size] = batch_df_base_sums
@@ -593,12 +684,14 @@ class Trainer():
                                     batch_df_base_sums = new_sums
                                     batch_df_base_counts = new_counts
 
+                            # Accumulate by variate id (includes PAD id 0; harmless)
                             batch_df_base_sums.scatter_add_(0, valid_var_ids, valid_df_base)
                             batch_df_base_counts.scatter_add_(0, valid_var_ids, torch.ones_like(valid_df_base, dtype=torch.float32))
 
                     if not math.isfinite(loss_value):
                         if self.rank==0:
                             print("Loss is {}, stopping validation".format(loss_value))
+                        # sys.exit(1)
 
                     loss /= self.trainer.accum_iter
             
@@ -607,16 +700,23 @@ class Trainer():
                 num_1d_vars=num_1d_vars[0]
                 num_depths=num_depths[0]
 
+                # Store full prediction distribution for uncertainty visualization
                 if isinstance(pred, dict) and 'distribution' in pred:
+                    # Store full distribution parameters
                     pred_to_store = {
                         'loc': pred['loc'].detach(),
                         'scale': pred['scale'].detach(),
-                        'df': pred['df'].detach(),
                         'mean': pred['distribution'].mean.detach()
                     }
+                    # df is Student-t only; Normal has no df
+                    if 'df' in pred and pred['df'] is not None:
+                        pred_to_store['df'] = pred['df'].detach()
                 else:
                     pred_to_store = pred.detach()
                 
+                # Move tensors to CPU to reduce GPU memory pressure, but be careful:
+                # - pred_to_store can be a dict of tensors
+                # - some batch metadata (datetime/lake names/ids) are not tensors
                 if isinstance(pred_to_store, dict):
                     preds_list_2d.append({k: (v.detach().cpu() if isinstance(v, torch.Tensor) else v)
                                           for k, v in pred_to_store.items()})
@@ -631,6 +731,7 @@ class Trainer():
                 
                 depth_val_list.append(depth_values_y.detach().cpu())
                 time_val_list.append(time_values_y.detach().cpu())
+                # datetime_y is now a 2D array (B, T)
                 datetime_list.append(datetime_y)
 
                 lake_names_list.append(lake_names)
@@ -643,19 +744,24 @@ class Trainer():
             avg_batch_loss = self.get_avg_loss(batch_loss, len(dataloader))
             avg_batch_pred_loss = self.get_avg_loss(batch_pred_loss, len(dataloader))
             
+            # Compute average df across all ranks - need to reduce both sum and count
             avg_batch_df_mean = None
             if batch_df_count > 0:
+                # Create tensors for distributed reduction
                 df_sum_tensor = torch.tensor(batch_df_sum, device=self.device)
                 df_count_tensor = torch.tensor(batch_df_count, device=self.device, dtype=torch.float32)
                 
+                # Reduce across all ranks
                 world_size = dist.get_world_size()
                 global_df_sum = reduce_mean(df_sum_tensor, world_size).item()
                 global_df_count = reduce_mean(df_count_tensor, world_size).item()
                 
+                # Compute weighted average: sum across all ranks / count across all ranks
                 total_df_sum = global_df_sum * world_size
                 total_df_count = global_df_count * world_size
                 avg_batch_df_mean = total_df_sum / total_df_count if total_df_count > 0 else None
 
+            # Compute variate-wise df_base means across ranks
             df_base_by_var_mean = None
             df_base_mean = None
             if batch_df_base_sums is not None:
@@ -663,6 +769,7 @@ class Trainer():
                 global_df_base_sums = reduce_mean(batch_df_base_sums, world_size) * world_size
                 global_df_base_counts = reduce_mean(batch_df_base_counts, world_size) * world_size
                 df_base_by_var_mean = (global_df_base_sums / global_df_base_counts.clamp_min(1e-6)).detach().cpu()
+                # Overall mean excluding PAD id 0
                 total_counts = global_df_base_counts.clone()
                 total_sums = global_df_base_sums.clone()
                 if total_counts.numel() > 1:
@@ -670,6 +777,7 @@ class Trainer():
                     if nonpad_count > 0:
                         df_base_mean = (total_sums[1:].sum() / nonpad_count).item()
 
+            # Reduce metrics across ranks to get global averages
             if metric_count > 0:
                 mse_tensor = torch.tensor(mse_sum, device=self.device)
                 mae_tensor = torch.tensor(mae_sum, device=self.device)
@@ -695,30 +803,43 @@ class Trainer():
             
 
         if self.rank==0 and plot:
+            # Concatenate all batches - need to pad to same length for irregular data - especially for irregular datasets
             if len(preds_list_2d) > 0:
+                # Handle predictions (can be dict or tensor)
                 if isinstance(preds_list_2d[0], dict):
+                    # Use helper function for each prediction component
+                    preds_dicts = preds_list_2d
                     preds_list_2d = {
-                        'loc': self._pad_and_concat_tensors([p['loc'] for p in preds_list_2d]),
-                        'scale': self._pad_and_concat_tensors([p['scale'] for p in preds_list_2d]),
-                        'df': self._pad_and_concat_tensors([p['df'] for p in preds_list_2d]),
-                        'mean': self._pad_and_concat_tensors([p['mean'] for p in preds_list_2d])
+                        'loc': self._pad_and_concat_tensors([p['loc'] for p in preds_dicts]),
+                        'scale': self._pad_and_concat_tensors([p['scale'] for p in preds_dicts]),
+                        'mean': self._pad_and_concat_tensors([p['mean'] for p in preds_dicts])
                     }
+                    # Optional: df for Student-t; keep key present as None for downstream plotters
+                    if all(('df' in p and p['df'] is not None) for p in preds_dicts):
+                        preds_list_2d['df'] = self._pad_and_concat_tensors([p['df'] for p in preds_dicts])
+                    else:
+                        preds_list_2d['df'] = None
                 else:
+                    # For non-dict predictions, use helper function
                     preds_list_2d = self._pad_and_concat_tensors(preds_list_2d)
                 
+                # Concatenate other tensors using helper function
                 labels_list_2d = self._pad_and_concat_tensors(labels_list_2d)
                 masks_list_2d = self._pad_and_concat_tensors(masks_list_2d)
                 var_ids_2d_list = self._pad_and_concat_tensors(var_ids_2d_list)
                 depth_val_list = self._pad_and_concat_tensors(depth_val_list)
                 time_val_list = self._pad_and_concat_tensors(time_val_list)
+                # datetime_list is now a list of 2D numpy arrays (B, T), pad and concatenate them
                 if len(datetime_list) > 0:
                     datetime_list = self._pad_and_concat_numpy_arrays(datetime_list)
                 else:
                     datetime_list = np.array([])
 
+                # Flatten lists of lists for lake names and ids
                 lake_names_list = [name for batch in lake_names_list for name in batch]
                 lake_id_list = [lid for batch in lake_id_list for lid in batch]
             else:
+                # Fallback if no data
                 preds_list_2d = None
                 labels_list_2d = None
                 masks_list_2d = None
@@ -760,20 +881,24 @@ class Trainer():
         batch_pred_loss = 0
         batch_lake_contrastive_loss = 0
         batch_gradient_norm = 0
+        # batch_temporal_contrastive_loss = 0
         
+        # Metric accumulators (sum over tokens); we'll divide by count after all-reduce
         mse_sum = 0.0
         mae_sum = 0.0
         crps_sum = 0.0
         metric_count = 0
         
+        # Track distribution parameters during training
         batch_df_sum = 0.0
         batch_df_count = 0
         batch_df_base_sums = None
         batch_df_base_counts = None
-        global_num_variates = None
+        global_num_variates = None  # size of variate vocabulary across all datasets
         df_base_by_var_mean = None
         df_base_mean = None
         
+        # Accumulate contrastive learning components for epoch-level logging
         cl_components_accum = {
             'lake_cl_loss': 0.0,
             'adaptive_weight': 0.0,
@@ -786,11 +911,23 @@ class Trainer():
         optimizer.zero_grad()
         
         self.model.train()
+        device_obj = torch.device(self.device)
+        if torch.cuda.is_available():
+            torch.cuda.reset_peak_memory_stats(device_obj)
+        prof_step_time_s = 0.0
+        prof_samples = 0
+        prof_valid_tokens = 0
 
         if self.rank==0:
             pbar=tqdm(total=len(dataloader), desc=f'Epoch {epoch + 1}/{self.max_epochs}', unit='batch')
 
         for iteration, sample in enumerate(dataloader):
+            # if iteration==len(dataloader)//2:
+            #     break
+            # batch = {k: v.to(self.device) if isinstance(v, torch.Tensor) else v for k, v in sample.items()}
+            # check_contrastive_batch_stats(batch, p_pos=self.cfg.dataloader.P_pos, print_freq=1, batch_idx=iteration)
+
+            # context data
             seq_X = sample["flat_seq_x"].to(self.device)
             mask_X = sample["flat_mask_x"].to(self.device) 
             sample_ids_x = sample["sample_ids_x"].to(self.device) 
@@ -800,7 +937,7 @@ class Trainer():
             depth_values_x = sample["depth_values_x"].to(self.device)
             time_values_x = sample["time_values_x"].to(self.device)
 
-            lake_ids = sample["lake_id"] 
+            lake_ids = sample["lake_id"] # lake id of each lake in batch
             lake_names = sample["lake_name"]
             idx = sample["idx"]
 
@@ -818,7 +955,12 @@ class Trainer():
                                         padding_mask=padding_mask_y,
                                         pred_len=self.pred_len,
                                         seq_len=self.seq_len)
+            prof_samples += int(seq_X.shape[0])
+            prof_valid_tokens += int(mask_out.sum().item())
                                         
+            if torch.cuda.is_available():
+                torch.cuda.synchronize(device_obj)
+            step_t0 = time.perf_counter()
             with torch.autocast(device_type='cuda'):
                 x_enc, pred, z = self.model(data=seq_X,
                                             observed_mask=mask_X,
@@ -892,6 +1034,7 @@ class Trainer():
                         batch_df_base_sums.scatter_add_(0, valid_var_ids, valid_df_base)
                         batch_df_base_counts.scatter_add_(0, valid_var_ids, torch.ones_like(valid_df_base, dtype=torch.float32))
                 
+                # Accumulate contrastive learning components for epoch-level logging
                 if cl_components is not None:
                     for key in cl_components_accum:
                         cl_components_accum[key] += cl_components[key]
@@ -905,8 +1048,13 @@ class Trainer():
                 loss /= self.trainer.accum_iter
                 
                 scaler.scale(loss).backward()
+                # scaler.step(optimizer)
+                # scheduler.step()
+                # scaler.update()
 
+                # we use a per iteration (instead of per epoch) lr scheduler
                 if (iteration + 1) % self.trainer.accum_iter == 0:
+                    # Calculate gradient norm for monitoring (without clipping)
                     if self.rank == 0 and iteration % 50 == 0:  # Print every 50 iterations
                         with torch.no_grad():
                             total_norm = torch.sqrt(sum(p.grad.norm()**2 for p in self.model.parameters() if p.grad is not None))
@@ -924,9 +1072,14 @@ class Trainer():
                     scaler.step(optimizer)
                     scaler.update()
                     optimizer.zero_grad() # reset grads after update
+                if torch.cuda.is_available():
+                    torch.cuda.synchronize(device_obj)
+                prof_step_time_s += (time.perf_counter() - step_t0)
                 
+                # ---------------- Metrics: MSE, MAE, CRPS ----------------
                 with torch.no_grad():
                     valid_mask_bool = mask_out.bool()
+                    # prediction mean
                     if isinstance(pred, dict) and 'distribution' in pred:
                         pred_mean_tensor = pred['distribution'].mean
                         dist_obj = pred['distribution']
@@ -941,6 +1094,7 @@ class Trainer():
                         mae_sum += F.l1_loss(yhat_valid, y_valid, reduction='sum').item()
                         metric_count += y_valid.numel()
 
+                    # CRPS Monte Carlo estimate if distribution present
                     if dist_obj is not None and y_valid.numel() > 0:
                         K = 16
                         try:
@@ -966,15 +1120,19 @@ class Trainer():
         avg_batch_pred_loss = self.get_avg_loss(batch_pred_loss, len(dataloader))
         avg_batch_gradient_norm = self.get_avg_loss(batch_gradient_norm, len(dataloader))
 
+        # Compute average df across all ranks - need to reduce both sum and count
         avg_batch_df_mean = None
         if batch_df_count > 0:
+            # Create tensors for distributed reduction
             df_sum_tensor = torch.tensor(batch_df_sum, device=self.device)
             df_count_tensor = torch.tensor(batch_df_count, device=self.device, dtype=torch.float32)
             
+            # Reduce across all ranks
             world_size = dist.get_world_size()
             global_df_sum = reduce_mean(df_sum_tensor, world_size).item()
             global_df_count = reduce_mean(df_count_tensor, world_size).item()
             
+            # Compute weighted average: sum across all ranks / count across all ranks
             total_df_sum = global_df_sum * world_size
             total_df_count = global_df_count * world_size
             avg_batch_df_mean = total_df_sum / total_df_count if total_df_count > 0 else None
@@ -983,6 +1141,30 @@ class Trainer():
             avg_batch_lake_contrastive_loss = self.get_avg_loss(batch_lake_contrastive_loss, len(dataloader))
         else:
             avg_batch_lake_contrastive_loss = None
+
+        # Profile compute performance (distributed aggregate):
+        # throughput = total samples/tokens processed divided by max rank compute time.
+        prof_samples_t = torch.tensor(float(prof_samples), device=self.device)
+        prof_tokens_t = torch.tensor(float(prof_valid_tokens), device=self.device)
+        prof_time_t = torch.tensor(float(prof_step_time_s), device=self.device)
+        peak_vram_gb_local = (
+            torch.cuda.max_memory_allocated(device_obj) / (1024 ** 3)
+            if torch.cuda.is_available() else 0.0
+        )
+        peak_vram_t = torch.tensor(float(peak_vram_gb_local), device=self.device)
+
+        if dist.is_available() and dist.is_initialized():
+            dist.all_reduce(prof_samples_t, op=dist.ReduceOp.SUM)
+            dist.all_reduce(prof_tokens_t, op=dist.ReduceOp.SUM)
+            dist.all_reduce(prof_time_t, op=dist.ReduceOp.MAX)
+            dist.all_reduce(peak_vram_t, op=dist.ReduceOp.MAX)
+
+        total_samples = float(prof_samples_t.item())
+        total_tokens = float(prof_tokens_t.item())
+        max_step_time_s = max(float(prof_time_t.item()), 1e-8)
+        train_throughput_samples_per_s = total_samples / max_step_time_s
+        train_throughput_tokens_per_s = total_tokens / max_step_time_s
+        train_peak_vram_gb = float(peak_vram_t.item())
 
         # Compute variate-wise df_base means across ranks
         df_base_by_var_mean = None
@@ -1018,7 +1200,9 @@ class Trainer():
             train_mae = None
             train_crps = None
 
+        # Print contrastive learning components at the end of each epoch (only from rank 0)
         if self.rank == 0 and self.use_lake_cl and cl_batch_count > 0:
+            # Calculate averages
             avg_cl_components = {key: value / cl_batch_count for key, value in cl_components_accum.items()}
             print(f"Epoch {epoch + 1} - Contrastive Learning Summary:")
             print(f"  lake_cl_loss: {avg_cl_components['lake_cl_loss']:.6f}")
@@ -1030,6 +1214,12 @@ class Trainer():
                 'lake_contrastive_loss': avg_batch_lake_contrastive_loss,
                 'gradient_norm': avg_batch_gradient_norm,
                 'df_mean': avg_batch_df_mean,
+                'param_count_total': int(self.total_params),
+                'param_count_trainable': int(self.trainable_params),
+                'train_peak_vram_gb': train_peak_vram_gb,
+                'train_compute_time_s': max_step_time_s,
+                'train_throughput_samples_per_s': train_throughput_samples_per_s,
+                'train_throughput_tokens_per_s': train_throughput_tokens_per_s,
                 'train_mse': train_mse,
                 'train_mae': train_mae,
                 'train_crps': train_crps,
@@ -1039,18 +1229,33 @@ class Trainer():
         updated_ds = copy.deepcopy(datasets)
         for ds in updated_ds:
             ds.__split__(flag=flag)
+            # if ds.coverage_threshold is not None:
+            #     ds.__build_valid_idx__()
         return updated_ds
 
     def get_finetune_lr_scheduler(self, 
                                 optimizer, 
                                 warmup_epochs,
                                 max_epochs):
+        """
+        Learning rate scheduler for fine-tuning with linear warmup from start_lr to max_warmup_lr,
+        then cosine annealing from max_warmup_lr down to min_lr.
+        Args:
+            optimizer: PyTorch optimizer
+            pretrain_lr: Learning rate from pretraining (for reference)
+            warmup_epochs: Number of warmup epochs (None to disable)
+            max_epochs: Total number of epochs (required for cosine annealing)
+            max_warmup_lr: Maximum LR during warmup (None to use base_lr/2)
+        """
         base_lr = optimizer.param_groups[0]['lr']
         start_lr = base_lr / 2
         max_warmup_lr = base_lr
 
         def lr_lambda(epoch):
             if epoch < warmup_epochs:
+                # Linear warmup from start_lr to max_warmup_lr
+                # Since LambdaLR multiplies by base_lr, we need to return the fraction
+                # that will give us the desired learning rate
                 warmup_fraction = epoch / float(max(1, warmup_epochs))
                 current_lr = start_lr + (max_warmup_lr - start_lr) * warmup_fraction
                 return current_lr / base_lr
@@ -1065,14 +1270,26 @@ class Trainer():
             return torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=max_epochs)
 
     def get_lr_scheduler(self, optimizer, max_epochs, warmup_epochs=None, max_warmup_lr=None):
+        """
+        Learning rate scheduler with optional warmup and max warmup LR cap.
+        
+        Args:
+            optimizer: PyTorch optimizer
+            max_epochs: Total number of epochs
+            warmup_epochs: Number of warmup epochs (None to disable) -> not using currently, only used as a flag
+            max_warmup_lr: Maximum LR during warmup (None to use base_lr)
+        """
         base_lr = optimizer.param_groups[0]['lr']
         max_warmup_lr = max_warmup_lr if max_warmup_lr is not None else base_lr
         
         def lr_lambda(epoch):
             if warmup_epochs is not None and epoch < warmup_epochs:
+                # WARMUP: Start from 0 (not base_lr!), linearly increase to max_warmup_lr
+                # Since LambdaLR multiplies by base_lr, we return the fraction: 0 to (max_warmup_lr/base_lr)
                 warmup_fraction = float(epoch) / float(max(1, warmup_epochs))
                 return warmup_fraction * (max_warmup_lr / base_lr)
             else:
+                # POST-WARMUP: Cosine annealing from max_warmup_lr down
                 cosine_factor = 0.5 * (1.0 + math.cos(math.pi * (epoch - warmup_epochs) / (max_epochs - warmup_epochs)))
                 return (max_warmup_lr / base_lr) * cosine_factor
         
@@ -1134,6 +1351,9 @@ class Trainer():
         
         self.model.to(self.device)
 
+        # Initialize model weights if specified
+        # self.apply_weight_initialization()
+
         optimizer = self.select_optimizer_()
         if self.trainer.use_lr_scheduler:
             if resume_states is not None:
@@ -1166,6 +1386,14 @@ class Trainer():
                                             distributed=True,
                                             use_cl=self.trainer.use_lake_cl)
 
+        test_datasets = self.update_split(datasets, flag='test')
+        test_dataloader = build_dataloader(datasets=test_datasets,
+                                            cfg=self.cfg.dataloader,
+                                            pad_value_id=self.pad_value_id,
+                                            pad_value_default=self.pad_value_default,
+                                            distributed=True,
+                                            use_cl=self.trainer.use_lake_cl)
+
         # plot data loader
         if plot_dataset:
             plot_train_dataloader = build_dataloader(datasets=plot_dataset, 
@@ -1190,6 +1418,8 @@ class Trainer():
         min_vali_loss = float("inf")
         val_loss = 0
         losses = np.full(self.max_epochs, np.nan)
+        train_epoch_time_total_s = 0.0
+        train_epoch_count = 0
 
         ckpt_path=os.path.join(self.trainer.pretrain_ckpts_dir, self.trainer.wandb_name)
         if not os.path.exists(ckpt_path) and self.rank==0:
@@ -1217,6 +1447,10 @@ class Trainer():
                     val_dataloader.sampler.set_epoch(epoch)
                 if hasattr(val_dataloader, 'batch_sampler') and hasattr(val_dataloader.batch_sampler, 'set_epoch'):
                     val_dataloader.batch_sampler.set_epoch(epoch)
+                if hasattr(test_dataloader, 'sampler') and hasattr(test_dataloader.sampler, 'set_epoch'):
+                    test_dataloader.sampler.set_epoch(epoch)
+                if hasattr(test_dataloader, 'batch_sampler') and hasattr(test_dataloader.batch_sampler, 'set_epoch'):
+                    test_dataloader.batch_sampler.set_epoch(epoch)
                 
                 epoch_time = time.time()
                 # Per-epoch dynamic window selection for TRAIN
@@ -1235,16 +1469,29 @@ class Trainer():
                         self.pred_len = chosen_pred
                         if self.rank == 0:
                             print(f"[TRAIN] Using window ctx={chosen_ctx}, pred={chosen_pred} for epoch {epoch}")
+                train_epoch_t0 = time.perf_counter()
                 train_elements = self.train_one_epoch(dataloader=train_dataloader,
                                                       optimizer=optimizer, 
                                                       scheduler=model_scheduler,
                                                       scaler=scaler,
                                                       epoch=epoch)
+                train_epoch_wall_time_s = time.perf_counter() - train_epoch_t0
+                train_epoch_time_total_s += train_epoch_wall_time_s
+                train_epoch_count += 1
+                avg_train_epoch_time_s = (
+                    train_epoch_time_total_s / max(train_epoch_count, 1)
+                )
+                avg_train_epochs_per_s = (
+                    (1.0 / avg_train_epoch_time_s) if avg_train_epoch_time_s > 0 else 0.0
+                )
 
+                #  # Step scheduler once per epoch, not per batch                                      
+                ######################
                 if model_scheduler is not None:
                     model_scheduler.step()
                 else:
                     pass
+                ######################
 
                 train_loss = train_elements['loss']
                 train_pred_loss = train_elements['pred_loss']
@@ -1255,9 +1502,15 @@ class Trainer():
                 train_mse = train_elements.get('train_mse', None)
                 train_mae = train_elements.get('train_mae', None)
                 train_crps = train_elements.get('train_crps', None)
+                train_peak_vram_gb = train_elements.get('train_peak_vram_gb', None)
+                train_compute_time_s = train_elements.get('train_compute_time_s', None)
+                train_thr_samples = train_elements.get('train_throughput_samples_per_s', None)
+                train_thr_tokens = train_elements.get('train_throughput_tokens_per_s', None)
+                param_count_total = train_elements.get('param_count_total', None)
+                param_count_trainable = train_elements.get('param_count_trainable', None)
                 
                 if self.rank==0:
-                    print("Epoch: {} cost time: {}".format(epoch + 1, time.time() - epoch_time))
+                    print("Epoch: {} cost time: {}".format(epoch + 1, train_epoch_wall_time_s))
 
                 if (epoch % self.cfg.eval_freq==0):
                     if self.rank==0:
@@ -1288,6 +1541,27 @@ class Trainer():
 
                         if self.rank==0:
                             pretty_print("Done Validating")
+
+                    # Test evaluation
+                    if self.rank==0:
+                        pretty_print("Testing")
+                    test_ds_list = getattr(test_dataloader.dataset, 'datasets', [test_dataloader.dataset])
+                    for ds in test_ds_list:
+                        ds.set_window_lengths(self.cfg.seq_len, self.cfg.pred_len)
+
+                    with torch.no_grad():
+                        test_elements = self.val_one_epoch(dataloader=test_dataloader,
+                                                           epoch=epoch,
+                                                           plot=False)
+                        test_loss = test_elements['loss']
+                        test_pred_loss = test_elements['pred_loss']
+                        test_lake_contrastive_loss = test_elements['lake_contrastive_loss']
+                        test_mse = test_elements.get('val_mse', None)
+                        test_mae = test_elements.get('val_mae', None)
+                        test_crps = test_elements.get('val_crps', None)
+
+                    if self.rank==0:
+                        pretty_print("Done Testing")
                 losses[epoch] = train_loss
                 
                 if epoch%self.cfg.eval_freq==0:
@@ -1316,6 +1590,21 @@ class Trainer():
                         metrics["train_mae"] = train_mae
                     if train_crps is not None:
                         metrics["train_crps"] = train_crps
+                    if train_peak_vram_gb is not None:
+                        metrics["train_peak_vram_gb"] = train_peak_vram_gb
+                    if train_compute_time_s is not None:
+                        metrics["train_compute_time_s"] = train_compute_time_s
+                    if train_thr_samples is not None:
+                        metrics["train_throughput_samples_per_s"] = train_thr_samples
+                    if train_thr_tokens is not None:
+                        metrics["train_throughput_tokens_per_s"] = train_thr_tokens
+                    if param_count_total is not None:
+                        metrics["model_param_count_total"] = param_count_total
+                    if param_count_trainable is not None:
+                        metrics["model_param_count_trainable"] = param_count_trainable
+                    metrics["train_epoch_time_s"] = train_epoch_wall_time_s
+                    metrics["train_avg_epoch_time_s"] = avg_train_epoch_time_s
+                    metrics["train_avg_epochs_per_s"] = avg_train_epochs_per_s
 
                     # Validation metrics
                     if val_mse is not None:
@@ -1324,6 +1613,18 @@ class Trainer():
                         metrics["val_mae"] = val_mae
                     if val_crps is not None:
                         metrics["val_crps"] = val_crps
+
+                    # Test metrics
+                    if test_loss is not None:
+                        metrics["test_loss"] = test_loss
+                    if test_pred_loss is not None:
+                        metrics["test_pred_loss"] = test_pred_loss
+                    if test_mse is not None:
+                        metrics["test_mse"] = test_mse
+                    if test_mae is not None:
+                        metrics["test_mae"] = test_mae
+                    if test_crps is not None:
+                        metrics["test_crps"] = test_crps
 
                     # Per-variable df_base logging (train and val) if available
                     train_df_base_by_var = train_elements.get('df_base_by_var_mean', None)
@@ -1359,6 +1660,21 @@ class Trainer():
                         metrics["train_df_mean"] = train_df_mean
                     if train_df_base_mean is not None:
                         metrics["train_df_base_mean"] = train_df_base_mean
+                    if train_peak_vram_gb is not None:
+                        metrics["train_peak_vram_gb"] = train_peak_vram_gb
+                    if train_compute_time_s is not None:
+                        metrics["train_compute_time_s"] = train_compute_time_s
+                    if train_thr_samples is not None:
+                        metrics["train_throughput_samples_per_s"] = train_thr_samples
+                    if train_thr_tokens is not None:
+                        metrics["train_throughput_tokens_per_s"] = train_thr_tokens
+                    if param_count_total is not None:
+                        metrics["model_param_count_total"] = param_count_total
+                    if param_count_trainable is not None:
+                        metrics["model_param_count_trainable"] = param_count_trainable
+                    metrics["train_epoch_time_s"] = train_epoch_wall_time_s
+                    metrics["train_avg_epoch_time_s"] = avg_train_epoch_time_s
+                    metrics["train_avg_epochs_per_s"] = avg_train_epochs_per_s
                 if (epoch % self.cfg.plot_freq==0):
                     # torch.distributed.barrier()
 
@@ -1380,6 +1696,8 @@ class Trainer():
                         "Validation loss decreased ({0:.4f} --> {1:.4f}).  Saving model epoch{2} ...".format(min_vali_loss, val_loss, epoch))
 
                     min_vali_loss = val_loss
+                    # model_ckpt = {'epoch': epoch, 
+                    # 'model_state_dict': self.model.module.state_dict()}
                     model_ckpt = {
                         'epoch': epoch, 
                         'model_state_dict': self.model.module.state_dict(),
@@ -1394,6 +1712,9 @@ class Trainer():
 
                 if (epoch + 1) % self.cfg.trainer.save_freq == 0 and self.rank==0:
                     print("Saving model at epoch {}...".format(epoch + 1))
+                    # model_ckpt = {'epoch': epoch, 
+                    # 'model_state_dict': self.model.module.state_dict()}
+                    
                     model_ckpt = {
                         'epoch': epoch, 
                         'model_state_dict': self.model.module.state_dict(),
@@ -1416,19 +1737,24 @@ class Trainer():
             wandb.summary['val_mse'] = val_mse
             wandb.summary['val_mae'] = val_mae
             wandb.summary['val_crps'] = val_crps
+            wandb.summary['test_nll_loss'] = test_pred_loss
+            wandb.summary['test_mse'] = test_mse
+            wandb.summary['test_mae'] = test_mae
+            wandb.summary['test_crps'] = test_crps
             wandb.finish()
             pretty_print("Model Pre-trained")
         return losses, self.model
 
 
     def plot_predictions(self, loader, flag, it):
+        # TODO: Add name of lakes to the plots
     
         pretty_print(f"Prediction Visualization :: {flag}")
         elements = self.val_one_epoch(dataloader=loader, epoch=it)
         preds=elements['preds2d']
         gt=elements['labels2d']
         var_ids=elements["var_ids_2d"]
-        depth_vals=elements['depth_vals']
+        depth_vals=elements['depth_vals'] # TODO: update depth vals to get raw/original depth values
         time_vals=elements['time_vals']
         datetime_raw_vals = elements['datetime_strs']
         gt_mask=elements['masks2d']
@@ -1450,6 +1776,7 @@ class Trainer():
             idx = np.arange(start, start+total_samples, 1)
             plt_idx = np.floor(np.linspace(0, 1, 1))
             try:
+                # Plot all samples in batch at T+1 (first prediction step)
                 self.irregular_plotter.plot_forecast_irregular_grid(
                     gt_row=gt,
                     preds_row=preds,
@@ -1480,13 +1807,25 @@ class Trainer():
         """
         Restore optimizer, scheduler, and scaler states from checkpoint.
         Model state should already be loaded in main().
+        
+        Returns:
+            start_epoch: Epoch to resume from
+            min_vali_loss: Best validation loss so far
         """
 
         # Load optimizer state
         if 'optimizer_state_dict' in resume_states:
+            # print(resume_states['optimizer_state_dict']["param_groups"])
             optimizer.load_state_dict(resume_states['optimizer_state_dict'])
             if self.rank == 0:
                 print("Restored optimizer state")
+
+        # Load scheduler state
+        # if scheduler is not None and 'scheduler_state_dict' in resume_states and resume_states['scheduler_state_dict'] is not None:
+        #     scheduler.load_state_dict(resume_states['scheduler_state_dict'])
+        #     scheduler
+        #     if self.rank == 0:
+        #         print(f"Restored scheduler state - current LR: {optimizer.param_groups[0]['lr']}")
         
         # Load scaler state
         if 'scaler_state_dict' in resume_states:
@@ -1498,6 +1837,8 @@ class Trainer():
         min_vali_loss = resume_states.get('min_vali_loss', float('inf'))
         training_stage = resume_states.get('training_stage', 'stage1')
         
+        # if self.rank == 0:
+        #     print(f"Resuming from epoch {start_epoch}, min_vali_loss: {min_vali_loss:.4f}, stage: {training_stage}")
         return start_epoch, min_vali_loss
 
     def init_weights(self, module):
@@ -1506,9 +1847,12 @@ class Trainer():
         Maintains activation and gradient scales across layers and model width.
         """
         if isinstance(module, nn.Linear):
+            # Scaled initialization for linear layers
+            # Scale by sqrt(fan_in) to maintain activation variance
             fan_in = module.weight.size(1)
-            std = (2.0 / fan_in) ** 0.5
+            std = (2.0 / fan_in) ** 0.5  # He initialization variant
             
+            # Additional scaling for transformers (common practice)
             if hasattr(self.trainer, 'init_scale'):
                 std *= self.trainer.init_scale
             else:

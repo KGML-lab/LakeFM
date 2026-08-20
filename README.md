@@ -1,4 +1,6 @@
 # LakeFM: Toward a Foundation Model for Aquatic Ecosystems Using Irregular Multivariate Multi-depth Time Series Data
+**Accepted at KDD 2026.**
+
 ![Proposed Approach](model.png)
 
 Understanding and forecasting lake dynamics is critical for monitoring water quality and ecosystem health across lakes and reservoirs. While machine learning methods have been recently applied to ecological time-series data, existing works assume regular sampling in time and depth, and struggle to generalize across lakes with heterogeneous variables, depths, and observation patterns. To address these limitations, we introduce LakeFM, a foundation model for aquatic systems, pre-trained on large-scale ecological datasets comprising both simulated and observed lakes. Through extensive empirical evaluation, we show that LakeFM learns meaningful representations spanning broader lake-level characteristics, and achieves competitive or often superior-forecasting performance compared to existing time-series foundation and non-foundation models, while producing physically plausible predictions consistent with real-world lake dynamics.
@@ -27,7 +29,7 @@ project_root/
     ├── data/                       # datasets
     ├── dev/
         ├── norm_stats              # normalization stats for lakefm
-        ├── pretain_ckpts
+        ├── pretrain_ckpts
 ```
 
 ## ⚙️ Environment Setup
@@ -84,7 +86,12 @@ For using any of the data and/or ckpt, add them to the corresponding dir (mentio
 
 3. LakeBeD dataset [Download](https://drive.google.com/file/d/10OzRxqh0RIrM7XMFY7wvlYT36uIGMjnZ/view?usp=drive_link) (`/resources/lakefm/data/LakeBeD-US`)
 
-LakeFM 5M Checkpoint [Download](https://drive.google.com/file/d/1YDlnLUG37rOfV-yr8dfOj4UXFNSj2QAB/view?usp=drive_link) (`resources/lakefm/dev/pretrain_ckpts`)
+4. EuroLakes data (download instructions pending) (`/resources/lakefm/data/newlakes/standardized`)
+
+Checkpoints:
+
+- LakeFM 7M (download link pending): `resources/lakefm/dev/pretrain_ckpts/lakefm7m.pth`
+- LakeFM 5M [Download](https://drive.google.com/file/d/1YDlnLUG37rOfV-yr8dfOj4UXFNSj2QAB/view?usp=drive_link): `resources/lakefm/dev/pretrain_ckpts/lakefm5m.pth`
 
 ---
 ## Running the code
@@ -100,6 +107,13 @@ Run eval for a lake
 ```
 bash scripts/driver.sh <run_name> <lake_name>
 ```
+
+To run the LakeFM 5M model, use:
+
+```
+bash scripts/eval_lakefm5m.sh <run_name> <lake_name>
+```
+
 `<run_name>` is where the output of the evaluation gets stored (it is the name of the output folder) <br>
 `<lake_name>` lake to be evaluated (e.g. AL, BARC, etc) <br>
 **Note:** update the train-val-test split in the `LakeBeD.yaml` `(src/cli/conf/pretrain/data/LakeBeD.yaml)` based on ID or OOD lake evaluation
@@ -109,11 +123,7 @@ Example:
 bash scripts/driver.sh eval_BARC BARC
 ```
 
-1. To run denormalized evaluation,
-
-   ```bash scripts/driver.sh <run_name> <lake_name> --denorm```
-
-2. To generate plots,
+1. To generate plots,
 
    ```bash scripts/driver.sh <run_name> <lake_name> <depth_m> --plot```
 
@@ -123,19 +133,19 @@ bash scripts/driver.sh eval_BARC BARC
 
    where `depth_m` is the depth at which to plot
 
-3. To plot for a subset of variables
+2. To plot for a subset of variables
 
     ```bash scripts/driver.sh <run_name> <lake_name> <depth_m> --plot --vars '["WaterTemp_C","Water_DO_mg_per_L"]'```
 
    plots for Water Temp and Water DO
 
-4. To perform variable masking
+3. To perform variable masking
 
    ```bash scripts/driver.sh <run_name> <lake_name> --mask-vars '["WaterTemp_C","Chla_ugL"]'```
 
    masks Water Temp and Chla. To generate plots, pass `--plot` and `--vars` with the list of variables to plot
 
-5. To perform depth masking
+4. To perform depth masking
 
    ```bash scripts/driver.sh <run_name> <lake_name> --mask-depths '[1.0,2.0,5.0]'```
    

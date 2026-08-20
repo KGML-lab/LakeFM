@@ -1,0 +1,81 @@
+_target_: data.builder.EuroLakes.EuroLakesBuilder
+
+server_prefix: raid
+root_dir: ${server_prefix}/lakefm/data/newlakes/standardized
+norm_path: ${server_prefix}/lakefm/dev/norm_stats
+
+Harp: Harp
+Lillsjoliden: Lillsjoliden
+Mangstrettjarn: Mangstrettjarn
+Ovre: Ovre
+Struptjarn: Struptjarn
+Nastjarn: Nastjarn
+Vortsjarv: Vortsjarv
+
+frequency: D
+
+train_fraction: 0.0
+val_fraction: 0.0
+test_fraction: 1.0
+
+# concatdataset or not
+merge: false
+
+# availability of variables
+lake_vars: true
+driver_vars: true
+param_vars: false
+
+vars_2d:
+  - WaterTemp_C
+  - Water_DO_mg_per_L
+  - Water_TP_mg_per_L
+  - tn
+  - Water_DOC_mg_per_L
+  - Chla_ugL
+  - SRP_ugL
+  - no3no2
+  - nh4
+vars_1d:
+  - Water_Secchi_m
+
+multi_dataset_file: false
+feature_cols_to_drop:
+  - lake_id
+  - date
+  - depth
+
+date_col: date
+lake_id_col: lake_id
+depth_col: depth
+
+scale: true
+shuffle: true
+drop_last: true
+
+lake_ids:
+  - Harp
+  - Lillsjoliden
+  - Mangstrettjarn
+  - Ovre
+  - Struptjarn
+  - Nastjarn
+  - Vortsjarv
+lake_names:
+  - Harp
+  - Lillsjoliden
+  - Mangstrettjarn
+  - Ovre
+  - Struptjarn
+  - Nastjarn
+  - Vortsjarv
+
+lake_ids_format: list
+
+mask_variable: null
+mask_depth: null
+mask_var_across_depths: false
+mask_depth_for_all_vars: false
+
+coverage_threshold: 0.80
+file_suffix: ".csv"

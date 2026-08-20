@@ -1,5 +1,9 @@
 import os
 import sys
+import socket
+# ensures 'src/' is in PYTHONPATH for imports and Hydra _target_
+# sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "..")))
+# sys.path.append(os.path.abspath(os.path.join('..', os.path.dirname(__name__))))
 import warnings
 import random
 import numpy as np
@@ -26,6 +30,72 @@ from lakefm.extract_embeddings import run_extract
 
 warnings.filterwarnings('ignore')
 
+def _get_env_int(name: str, default: int | None = None) -> int | None:
+    value = os.environ.get(name, None)
+    if value is None:
+        return default
+    try:
+        return int(value)
+    except ValueError as exc:
+        raise RuntimeError(f"Environment variable {name} must be an integer, got: {value!r}") from exc
+
+
+def _validate_cuda_ddp_env(world_size: int, local_rank: int, local_world_size: int):
+    if not torch.cuda.is_available():
+        raise RuntimeError("CUDA is not available, but DDP/NCCL launch was requested.")
+
+    visible_gpu_count = torch.cuda.device_count()
+    if visible_gpu_count < 1:
+        raise RuntimeError("No visible CUDA devices found for this process.")
+
+    if local_rank >= visible_gpu_count:
+        raise RuntimeError(
+            f"Invalid LOCAL_RANK={local_rank} for visible_gpu_count={visible_gpu_count}. "
+            f"CUDA_VISIBLE_DEVICES={os.environ.get('CUDA_VISIBLE_DEVICES', '<unset>')}"
+        )
+
+    if local_world_size > visible_gpu_count:
+        raise RuntimeError(
+            f"LOCAL_WORLD_SIZE={local_world_size} exceeds visible_gpu_count={visible_gpu_count}. "
+            f"CUDA_VISIBLE_DEVICES={os.environ.get('CUDA_VISIBLE_DEVICES', '<unset>')}"
+        )
+
+    expected_local_world_size = _get_env_int("EXPECTED_LOCAL_WORLD_SIZE", None)
+    if expected_local_world_size is not None and local_world_size != expected_local_world_size:
+        raise RuntimeError(
+            f"Expected LOCAL_WORLD_SIZE={expected_local_world_size}, got {local_world_size}. "
+            "Check --nproc_per_node and launcher arguments."
+        )
+
+    expected_world_size = _get_env_int("EXPECTED_WORLD_SIZE", None)
+    if expected_world_size is not None and world_size != expected_world_size:
+        raise RuntimeError(
+            f"Expected WORLD_SIZE={expected_world_size}, got {world_size}. "
+            "Check torchrun launch arguments."
+        )
+
+
+def _print_rank_device_summary(rank: int, world_size: int, local_rank: int):
+    payload = {
+        "rank": rank,
+        "local_rank": local_rank,
+        "host": socket.gethostname(),
+        "device": torch.cuda.current_device(),
+        "device_name": torch.cuda.get_device_name(torch.cuda.current_device()),
+    }
+    gathered = [None for _ in range(world_size)]
+    torch.distributed.all_gather_object(gathered, payload)
+
+    if rank == 0:
+        print("DDP sanity summary:")
+        for item in sorted(gathered, key=lambda x: x["rank"]):
+            print(
+                f"  rank={item['rank']}/{world_size - 1} "
+                f"host={item['host']} local_rank={item['local_rank']} "
+                f"device={item['device']} name={item['device_name']}"
+            )
+
+
 def seed_everything(seed: int = 42):
     random.seed(seed)
     np.random.seed(seed)
@@ -46,13 +116,20 @@ def main(cfg: DictConfig):
     rank = int(os.environ.get("RANK", 0))
     world_size = int(os.environ.get("WORLD_SIZE", 1))
     local_rank = int(os.environ.get("LOCAL_RANK", 0))
+    local_world_size = int(os.environ.get("LOCAL_WORLD_SIZE", 1))
+    print(f"Rank {rank}: Using device: cuda:{local_rank} = {torch.cuda.get_device_name(local_rank)}")
+    _validate_cuda_ddp_env(world_size, local_rank, local_world_size)
 
     # Set up device and DDP
     torch.cuda.set_device(local_rank)
     torch.distributed.init_process_group(backend="nccl")
 
     print(f"[Rank {local_rank}] Using device: cuda:{local_rank} = {torch.cuda.get_device_name(local_rank)}")
+    _print_rank_device_summary(rank, world_size, local_rank)
 
+    # if cfg.task_name == 'evaluate':
+    #     cfg = get_final_eval_cfg(cfg)
+    
     if cfg.tf32:
         assert cfg.trainer.precision == 32
         torch.backends.cuda.matmul.allow_tf32 = True
@@ -88,6 +165,11 @@ def main(cfg: DictConfig):
         if rank == 0:
             pretty_print("Starting Pre-training")
         trainer.pretrain(datasets, plot_dataset, resume_states=resume_states)
+    # elif cfg.task_name == 'finetune':
+    #     # not implemented
+    #     if rank == 0:
+    #         pretty_print("Starting Fine-tuning")
+    #     trainer.finetune(datasets, plot_dataset, resume_states=resume_states)
     elif cfg.task_name == 'evaluate':
         if rank == 0:
             pretty_print("Starting Evaluation")

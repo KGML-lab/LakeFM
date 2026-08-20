@@ -4,7 +4,8 @@ import numpy as np
 
 from tqdm import tqdm
 from data.dataset import LakeDataset
-from data.eval_dataset import LakeEvalDataset
+# from data.eval_dataset import LakeEvalDataset
+from data.eval_dataset_regular import LakeEvalDataset
 from torch.utils.data import ConcatDataset
 from utils.exp_utils import pretty_print
 from data.builder.base import BaseLakeBuilder
@@ -35,6 +36,7 @@ class FCRSimPhyBuilder():
         self.lake_id_col = self.cfg['lake_id_col']
         self.base = base_builder
 
+        # for ood sites, we need to override the normalization stats -> normalization is independently done for each context window
         if self.base.norm_override:
             self.norm_path = None
 

@@ -3,6 +3,7 @@ _target_: data.builder.LakeBeD.LakeBeDBuilder
 server_prefix: raid
 root_dir: ${server_prefix}/lakefm/data/LakeBeD-US
 norm_path: ${server_prefix}/lakefm/dev/norm_stats
+eval_root_dir: ${server_prefix}/lakefm/data/LakeBeD-US-Post-KDD/Data
 
 AL: AL_NTL
 BARC: BARC_NEON_LF
@@ -72,6 +73,7 @@ mask_depth_for_all_vars: false
 
 coverage_threshold: 0.80
 lake_suffix: "_2D.parquet"
+lake_eval_suffix: "_2D_test.csv"
 driver_suffix: "_1D.parquet"
 
 data_split: 'train'

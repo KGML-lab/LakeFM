@@ -637,6 +637,10 @@ class Utils:
     def normalize_tensor(self, tensor, use_stat=False):
         
         eps = 1e-5 # epsilon for zero std
+        # print(f"tensor[] self inp cols shape = {tensor[:, :, self.inp_cols].shape}")
+        # if not use_stat:
+        #     self.feat_mean = tensor[:, :, :len(self.inp_cols)].mean(dim=(0, 1))[None, None, :]
+        #     self.feat_std = tensor[:, :, :len(self.inp_cols)].std(dim=(0, 1))[None, None, :]
         
         '''
         use this when working on masked data
@@ -699,7 +703,11 @@ class Utils:
             L = df.shape[0]
             num_samples = (L - self.pre_train_window) // self.stride + 1
 
+            # dfX = df[self.inp_cols]
+
             X = [] #np.zeros([num_samples, self.pre_train_window, self.num_features])
+            # target_X = np.zeros([self.input_window, num_samples, self.num_out_features])
+            # shuffled_inds = random.sample(range(num_samples),num_samples)
             
             for ii in tqdm(np.arange(num_samples)):
                 start_x = self.stride * ii
@@ -708,10 +716,19 @@ class Utils:
                 subset_df = df.iloc[start_x:end_x, :].copy(deep=True)
                 
                 X.append(np.expand_dims(subset_df, axis=0))
-            
+                
+                # if X.shape[0]==0:
+                #     X = np.expand_dims(subset_dfX, axis=0)
+                # else:
+                #     toAdd = np.expand_dims(subset_dfX, axis=0)
+                #     X = np.append(X, toAdd, axis=0)
 
             X = np.concatenate(X, axis=0)
             
+            # with open(save_path, 'wb') as pickle_file:
+            #     pickle.dump(X, pickle_file)
+            #     print(f"Pickled dataset {filename}")
+
             return X
     
     def plot_context_window_grid_with_original_masks(self, df, preds, og_masks, sample_index, epoch, train_or_val, title_prefix):
@@ -755,6 +772,8 @@ class Utils:
                         color='green')
                 ax.plot(dates, masked_ts[sample_id, :, 0], label='Original TS', marker='o', linestyle='-', markersize=1, 
                          color='blue')
+                # ax.plot(dates, masked_ts[sample_id, :, 0], label='Original Masked TS', marker='o', linestyle='-', markersize=1,
+                #          markerfacecolor='yellow', markeredgecolor='yellow', color='yellow', alpha=0.9)
                 ax.axvline(x=self.seq_len, color='black', linestyle='-', linewidth=2)
                 
                 subtitle = '{}'.format(feature_name)
@@ -775,6 +794,8 @@ class Utils:
                             color='green')
                     ax.plot(dates, masked_ts[sample_id, :, idx], label='Original TS', marker='o', linestyle='-', markersize=1, 
                          color='blue')
+                    # ax.plot(dates, masked_ts[sample_id, :, idx], label='Original Masked TS', marker='o', linestyle='-', markersize=1,
+                    #          markerfacecolor='yellow', markeredgecolor='yellow', color='yellow', alpha=0.9)
                     
                     if self.task_name=='finetune' or self.task_name=='zeroshot':
                         plt.tight_layout()
@@ -795,6 +816,12 @@ class Utils:
 
 
 class Normalizer:
+    """
+    Comprehensive normalization management for lake data.
+    
+    Handles both per-lake normalization and global variable-level aggregated statistics
+    for zero-shot inference across different lakes/datasets.
+    """
     
     def __init__(self, lake_id=None, lake_name=None, id2var=None, variate_ids_2D=None, variate_ids_1D=None, run_name=None, ckpt_name=None):
         """
@@ -935,6 +962,22 @@ class Normalizer:
     
     @staticmethod
     def denormalize_scale_by_var_ids(values, var_ids, scaler_DF, variate_ids_2D, scaler_DR=None, variate_ids_1D=None):
+        """
+        Denormalize standard deviation/scale values by multiplying by original std (no mean shift).
+        
+        For standard deviation: denormalized_std = normalized_std * original_std
+        
+        Args:
+            values: torch.Tensor of normalized scale/std values (any shape, will be flattened)
+            var_ids: torch.Tensor of variable IDs, same shape as values
+            scaler_DF: sklearn StandardScaler for lake (2D) variables (required for lake vars)
+            variate_ids_2D: list of variable IDs that correspond to lake (2D) variables
+            scaler_DR: optional sklearn StandardScaler for driver (1D) variables
+            variate_ids_1D: optional list of variable IDs for driver (1D) variables
+        
+        Returns:
+            torch.Tensor with same shape as values, denormalized per variable (only scaled, not shifted).
+        """
         import torch
         if values is None or var_ids is None:
             return values
@@ -1117,6 +1160,15 @@ class Normalizer:
         Aggregate statistics for a single variable using proper mathematical formulas.
         
         Combines existing global stats with new dataset stats to compute true aggregated mean and std.
+        
+        Args:
+            global_stats: Global statistics dictionary to update
+            var_name: Name of the variable
+            new_mean: Mean from new dataset
+            new_std: Standard deviation from new dataset  
+            new_var: Variance from new dataset
+            n_new: Number of samples in new dataset
+            dataset_name: Name of the dataset being processed
         """
         if var_name not in global_stats["variables"]:
             # First time seeing this variable
@@ -1181,6 +1233,7 @@ class Normalizer:
         self.scaler_DF = StandardScaler()
         
         # Set global statistics for driver variables
+        # if hasattr(self.data_DR, 'shape') and self.data_DR.shape[1] > 0:
         driver_means = []
         driver_stds = []
         
@@ -1204,6 +1257,7 @@ class Normalizer:
         self.scaler_DR.n_features_in_ = len(driver_means)
         
         # Set global statistics for lake variables
+        # if hasattr(self.data_DF, 'shape') and self.data_DF.shape[1] > 0:
         lake_means = []
         lake_stds = []
         
@@ -1261,6 +1315,11 @@ class Normalizer:
             scale = np.array(dr_stats['scale'])
             var = np.array(dr_stats['var'])
             
+            # # Check for shape mismatch
+            # if mean.shape[0] != self.data_DR.shape[1]:
+            #     print(f"Warning: Loaded DR stats shape ({mean.shape[0]}) "
+            #           f"does not match data shape ({self.data_DR.shape[1]}).")
+            
             # Manually set the scaler attributes
             self.scaler_DR.mean_ = mean
             self.scaler_DR.scale_ = scale
@@ -1269,6 +1328,8 @@ class Normalizer:
         else:
             raise RuntimeError(f"'scaler_DR' not found in {stats_path} or was empty. Cannot apply normalization for DR variables. Please check your normalization stats file.")
 
+        # # 3. Apply stats for Lake (DF) variables
+        # if hasattr(self, 'data_DF') and self.data_DF.shape[1] > 0:
         self.scaler_DF = StandardScaler()
         
         # Check if stats for DF are available

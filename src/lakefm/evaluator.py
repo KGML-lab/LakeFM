@@ -31,6 +31,10 @@ from dataclasses import dataclass
 from typing import Optional, Any
 
 class Evaluator:
+    """
+    Standalone evaluator with embedded validation loop that logs metrics to W&B under cfg.evaluator.
+    Supports multiple trials and incremental saving of predictions to disk.
+    """
     @staticmethod
     def _tplusn_update_date_horizon_acc(
         acc: dict,
@@ -44,6 +48,17 @@ class Evaluator:
         origin_time_id: int,
         max_horizon: int = 14,
     ) -> None:
+        """
+        Update a per-variate accumulator that maps:
+          date (YYYY-MM-DD) -> length-(max_horizon) vectors of pred sums and counts,
+          plus a single GT value aggregated *by date* (independent of horizon).
+
+        - Only tokens for `target_var_id` are used.
+        - Horizon is computed as: horizon = time_id - origin_time_id (1..max_horizon).
+        - If multiple tokens land in the same (date, horizon) cell (e.g., multiple depths),
+          we average via sum/count.
+        - GT is aggregated by date only (so GT for a date is identical across all horizons).
+        """
         if max_horizon <= 0:
             return
 
@@ -59,6 +74,14 @@ class Evaluator:
         dts = [dates[i] for i, ok in enumerate(vmask_np) if ok]
 
         def _normalize_date_key(dt_val) -> str:
+            """
+            Return a YYYY-MM-DD string from a datetime-like input.
+            Supports:
+              - numpy datetime64
+              - ISO datetime strings
+              - Unix epoch seconds (int/float or numeric string)
+            Falls back to the first 10 chars of `str(dt_val)` if parsing fails.
+            """
             try:
                 # numpy datetime64 path
                 if isinstance(dt_val, np.datetime64):
@@ -74,9 +97,12 @@ class Evaluator:
                 if s == "" or s.lower() == "nat":
                     return ""
 
+                # numeric epoch seconds (common in some LakeBeD exports)
+                # e.g. "1593993600" -> 2020-07-06
                 if re.fullmatch(r"[-+]?\d+(\.\d+)?", s):
                     x = float(s)
                     ax = abs(x)
+                    # Heuristic: seconds ~ 1e9, ms ~ 1e12, us ~ 1e15, ns ~ 1e18
                     if ax >= 1e17:
                         ts = pd.to_datetime(int(x), unit="ns", utc=True, errors="coerce")
                     elif ax >= 1e14:
@@ -90,6 +116,7 @@ class Evaluator:
 
                 if pd.isna(ts):
                     return s[:10]
+                # normalize to date in UTC, drop tz
                 ts = pd.Timestamp(ts)
                 if ts.tzinfo is not None:
                     ts = ts.tz_convert("UTC").tz_localize(None)
@@ -126,6 +153,9 @@ class Evaluator:
         self.model = model
         self.rank = rank
         self.device = f"cuda:{rank}"
+        model_ref = self.model.module if hasattr(self.model, "module") else self.model
+        self.total_params = sum(p.numel() for p in model_ref.parameters())
+        self.trainable_params = sum(p.numel() for p in model_ref.parameters() if p.requires_grad)
         self.trainer = trainer
         self.pred_len = cfg.pred_len
         self.seq_len = cfg.seq_len
@@ -144,7 +174,11 @@ class Evaluator:
         self.heatmap_plotter = SpatioTemporalHeatmapPlotter(self.device, self.pad_value_default)
         self.plot = getattr(cfg.evaluator, "plot", True)
 
-        # Thermocline experiment
+    
+
+        # Thermocline experiment (Water Temp heatmap + inversion metrics)
+        # - Can be enabled via cfg.evaluator.thermocline=true
+        # - Supports optional overrides for the target variable and season window
         self.thermocline = bool(getattr(cfg.evaluator, "thermocline", False))
         if self.thermocline:
             self.thermocline_var_name_substr = str(getattr(cfg.evaluator, "thermocline_var_name_substr", "WaterTemp_C")).strip()
@@ -152,10 +186,12 @@ class Evaluator:
             self.thermocline_end_date = getattr(cfg.evaluator, "thermocline_end_date", None)
             self.thermocline_season_start = str(getattr(cfg.evaluator, "thermocline_season_start", "06-01")).strip()
             self.thermocline_season_end = str(getattr(cfg.evaluator, "thermocline_season_end", "09-30")).strip()
+            # Plot-only MM-DD fallback (defaults to Apr 1 – Nov 30)
             self.thermocline_max_depths = int(getattr(cfg.evaluator, "thermocline_max_depths", 50))
             self.thermocline_depth_round_decimals = int(getattr(cfg.evaluator, "thermocline_depth_round_decimals", 6))
             self.thermocline_skip_irregular_plots = bool(getattr(cfg.evaluator, "thermocline_skip_irregular_plots", True))
-            self.thermocline_eval_years = getattr(cfg.evaluator, "thermocline_eval_years", [2019, 2020])
+            # Evaluation years for thermocline metrics (default: 2018, 2019 and 2020)
+            self.thermocline_eval_years = getattr(cfg.evaluator, "thermocline_eval_years", [2018, 2019, 2020])
 
         # Beer-lambert experiment
         self.BL = bool(getattr(cfg.evaluator, "BL", False))
@@ -187,6 +223,7 @@ class Evaluator:
         
         self.id_to_var = self.data.id_to_var
         self.var_to_id = self.data.var_to_id
+        # Depth denormalization parameters (per dataset)
         self.depth_min = None
         self.depth_max = None
         
@@ -195,6 +232,9 @@ class Evaluator:
 
     @staticmethod
     def _parse_mmdd(mmdd: str, default=(6, 1)) -> tuple:
+        """
+        Parse "MM-DD" into (month, day).
+        """
         try:
             mm, dd = mmdd.split("-")
             m = int(mm)
@@ -206,7 +246,11 @@ class Evaluator:
         return default
 
     @staticmethod
-    def _resolve_var_id_by_substr(id_to_var: dict, prefer_substr: str):
+    def _resolve_var_id_by_substr(id_to_var: dict, prefer_substr: str) -> Optional[int]:
+        """
+        Best-effort: find a variable id whose name contains prefer_substr (case-insensitive).
+        If not found, fall back to a WaterTemp-like heuristic.
+        """
         if not isinstance(id_to_var, dict) or not id_to_var:
             return None
         prefer = (prefer_substr or "").lower().strip()
@@ -231,7 +275,13 @@ class Evaluator:
         candidates.sort(key=lambda x: (x[0], x[1], x[2]))
         return int(candidates[0][2])
 
-    def _resolve_var_id(self, *, var_name: Optional[str], id_to_var: dict):
+    def _resolve_var_id(self, *, var_name: Optional[str], id_to_var: dict) -> Optional[int]:
+        """
+        Resolve a variable id from a variable name.
+
+        Primary path (preferred): cfg.data.var_to_id exact lookup, e.g. "WaterTemp_C" -> 7.
+        Fallback: substring/heuristic match over id_to_var (kept for robustness when var_to_id is absent).
+        """
         name = str(var_name).strip() if var_name is not None else ""
         if name:
             try:
@@ -240,6 +290,7 @@ class Evaluator:
                     return int(v2id[name])
             except Exception:
                 pass
+        # Fallback: substring match on id_to_var
         return self._resolve_var_id_by_substr(id_to_var, name)
 
     @dataclass
@@ -265,7 +316,8 @@ class Evaluator:
         selected_sample: Optional[dict]
         profiles_by_date: dict
 
-    # ---------------- Thermocline experiment
+    # ---------------- Thermocline experiment (WaterTemp inversion + heatmap) ----------------
+    @dataclass
     class _ThermoConfig:
         enabled: bool
         var_name: str
@@ -279,13 +331,16 @@ class Evaluator:
     @dataclass
     class _ThermoState:
         out_dir: Optional[str]
+        # profiles_metric[(lake_id, day_str)][depth_key] = {"dt": Timestamp, "depth": float, "gt": float, "pred": float}
         profiles_metric: dict
+        # profiles_plot[(lake_id, day_str)][depth_key] = {"dt": Timestamp, "depth": float, "gt": float, "pred": float}
         profiles_plot: dict
         lake_id_to_name: dict
 
     def _thermo_make_config(self) -> Optional["_ThermoConfig"]:
         if not self.thermocline or self.rank != 0:
             return None
+        # Resolve var id from cfg.data.var_to_id (preferred) with fallback
         var_id = self._resolve_var_id(var_name=self.thermocline_var_name_substr, id_to_var=self.data.id_to_var)
         if var_id is None:
             if self.rank == 0:
@@ -293,6 +348,8 @@ class Evaluator:
             return None
         var_name = str(self.data.id_to_var.get(int(var_id), self.thermocline_var_name_substr))
 
+        # Season window for metrics as MM-DD, applied within specific years.
+        # If user provided YYYY-MM-DD start/end, we take their MM-DD portion and apply to all eval years.
         season_start_mmdd = str(self.thermocline_season_start)
         season_end_mmdd = str(self.thermocline_season_end)
         if self.thermocline_start_date is not None and self.thermocline_end_date is not None:
@@ -329,6 +386,8 @@ class Evaluator:
             out_dir = os.path.join(save_dir, "THERMOCLINE")
             os.makedirs(out_dir, exist_ok=True)
         return Evaluator._ThermoState(out_dir=out_dir, profiles_metric={}, profiles_plot={}, lake_id_to_name={})
+
+    # NOTE: plotting uses ALL dates; metrics are filtered by (year, MM-DD season) in _thermo_finalize.
 
     def _thermo_update(
         self,
@@ -399,6 +458,11 @@ class Evaluator:
             inv = 0
             tot = 0
             inversion_depths = []
+            # DEBUG: Log the input
+            # if len(values_by_depth) > 0:
+            #     print(f"[DEBUG profile_inversions] Called with {len(values_by_depth)} depths")
+            #     print(f"[DEBUG profile_inversions] Depth values: {[d for d, v in values_by_depth]}")
+            #     print(f"[DEBUG profile_inversions] Temperature values: {[v for d, v in values_by_depth]}")
             for i in range(len(values_by_depth) - 1):
                 v0 = values_by_depth[i][1]
                 v1 = values_by_depth[i + 1][1]
@@ -407,7 +471,14 @@ class Evaluator:
                 tot += 1
                 if v1 > v0:
                     inv += 1
+                    # Record the deeper depth (i+1) where the inversion occurs
                     inversion_depths.append(float(values_by_depth[i + 1][0]))
+            # DEBUG: Log the result
+            # print(f"[DEBUG profile_inversions] Counted {tot} pairs, {inv} inversions")
+            # if inv > 0:
+            #     print(f"[DEBUG profile_inversions] Inversion depths: {inversion_depths}")
+            # if tot != len(values_by_depth) - 1:
+            #     print(f"[WARNING] Expected {len(values_by_depth) - 1} pairs but got {tot} pairs!")
             return inv, tot, inversion_depths
 
         def profile_from_depthmap(depthmap: dict, field: str) -> list:
@@ -417,6 +488,7 @@ class Evaluator:
                 pts = pts[: int(cfg.max_depths)]
             return pts
 
+        # Helper: compute metrics for a filtered subset of profiles_metric
         def compute_metrics(profile_items):
             per_lake = {}
             overall_daily = {}
@@ -441,6 +513,7 @@ class Evaluator:
                 
                
                 inv_g, tot_g, inv_depths_g = profile_inversions(pts_gt)
+                # print(f"[DEBUG] Calling profile_inversions for Pred:")
                 inv_p, tot_p, inv_depths_p = profile_inversions(pts_pr)
                 rate_g = (float(inv_g) / float(tot_g)) if tot_g > 0 else None
                 rate_p = (float(inv_p) / float(tot_p)) if tot_p > 0 else None
@@ -507,6 +580,7 @@ class Evaluator:
                 "by_lake": per_lake_out,
             }
 
+        # Compute metrics per year over the season MM-DD window
         start_md = self._parse_mmdd(cfg.season_start_mmdd, default=(6, 1))
         end_md = self._parse_mmdd(cfg.season_end_mmdd, default=(9, 30))
 
@@ -538,7 +612,7 @@ class Evaluator:
 
         payload = {
             "metric": "thermocline_inversion_rate",
-            "definition": "Plots use the full available timeline.",
+            "definition": "Plots use the full available timeline. Metrics are computed per-year over the same MM-DD season window: inversions are adjacent depth pairs where T(deeper) > T(shallower).",
             "config": {
                 "var_id": int(cfg.var_id),
                 "var_name": str(cfg.var_name),
@@ -556,13 +630,16 @@ class Evaluator:
         with open(out_path, "w") as f:
             json.dump(payload, f, indent=2)
 
+        # Plot: WaterTemp heatmap (GT vs Pred) over the FULL available timeline, per lake_id
         try:
             lake_ids = sorted({int(lid) for (lid, _day) in state.profiles_plot.keys()})
             for lid in lake_ids:
+                # All days for this lake
                 days = sorted({day for (lid2, day) in state.profiles_plot.keys() if int(lid2) == int(lid)})
                 if not days:
                     continue
 
+                # Build a continuous daily axis for plotting (matches "days from <start>")
                 try:
                     day_ts = pd.to_datetime(days, errors="coerce")
                     day_ts = pd.DatetimeIndex([d for d in day_ts if not pd.isna(d)])
@@ -577,10 +654,12 @@ class Evaluator:
                     full_days = pd.date_range(plot_start, plot_end, freq="D")
                 except Exception:
                     full_days = day_ts.sort_values().unique()
+                # Guard against accidentally huge ranges (e.g., MM-DD fallback across many years)
                 if len(full_days) > 2000:
                     full_days = day_ts.sort_values().unique()
                 full_day_strs = [pd.Timestamp(d).strftime("%Y-%m-%d") for d in full_days]
 
+                # Union depths across all days (from stored profiles)
                 depth_union = set()
                 for day in full_day_strs:
                     dm = state.profiles_plot.get((lid, day), {})
@@ -607,9 +686,11 @@ class Evaluator:
                             gt_mat[i, j] = float(rec["gt"])
                             pr_mat[i, j] = float(rec["pred"])
 
+                # Interpolate to get a smooth seasonal heatmap (like the reference)
                 try:
                     gt_df = pd.DataFrame(gt_mat, index=depths, columns=full_day_strs, dtype=float)
                     pr_df = pd.DataFrame(pr_mat, index=depths, columns=full_day_strs, dtype=float)
+                    # Interpolate along time (axis=1) then depth (axis=0)
                     gt_df = gt_df.interpolate(axis=1, limit_direction="both").interpolate(axis=0, limit_direction="both")
                     pr_df = pr_df.interpolate(axis=1, limit_direction="both").interpolate(axis=0, limit_direction="both")
                     gt_mat_plot = gt_df.values
@@ -625,6 +706,7 @@ class Evaluator:
                 vmin = float(min(np.nanmin(gt_masked), np.nanmin(pr_masked)))
                 vmax = float(max(np.nanmax(gt_masked), np.nanmax(pr_masked)))
 
+                # X axis in "days from start" (reference style)
                 x_vals = np.arange(Tn, dtype=int)
                 try:
                     x_vals = (pd.to_datetime(full_day_strs) - pd.Timestamp(plot_start)).days.values.astype(int)
@@ -676,11 +758,13 @@ class Evaluator:
                 ax_pr.set_yticks(np.arange(Dn))
                 ax_pr.set_yticklabels([f"{d:.2f}" for d in depths])
 
+                # One shared colorbar (reference style), placed in a dedicated axis to avoid overlap.
                 fig.subplots_adjust(right=0.90)
                 cax = fig.add_axes([0.92, 0.15, 0.02, 0.70])  # [left, bottom, width, height]
                 cbar = fig.colorbar(im2, cax=cax)
                 cbar.set_label("Water Temperature (°C)")
 
+                # Leave room for colorbar axis on the right.
                 fig.tight_layout(rect=[0, 0, 0.90, 1])
                 lake_name = state.lake_id_to_name.get(lid, None)
                 suffix = str(lake_name) if lake_name else f"lake_{lid}"
@@ -691,7 +775,8 @@ class Evaluator:
             if self.rank == 0:
                 print(f"[thermocline] Warning: failed to write heatmap plot(s): {e}")
 
-    def _bl_make_config(self):
+    def _bl_make_config(self) -> "_BLConfig":
+        # resolve var ids from config (fallback to base mapping)
         var_to_id = None
         try:
             var_to_id = OmegaConf.to_container(self.cfg.data.var_to_id, resolve=True)
@@ -699,6 +784,7 @@ class Evaluator:
             var_to_id = None
         chla_var_id = int(var_to_id.get("Chla_ugL", 5)) if isinstance(var_to_id, dict) else 5
         att_var_id = int(var_to_id.get("LightAttenuation_Kd", 4)) if isinstance(var_to_id, dict) else 4
+        # Parse plot dates
         plot_dates = None
         try:
             pdv = self.bl_plot_dates
@@ -709,6 +795,7 @@ class Evaluator:
             else:
                 s = str(pdv)
                 if s.startswith("[") and s.endswith("]"):
+                    # hydra stringified list
                     plot_dates = [x.strip().strip('"').strip("'") for x in s[1:-1].split(",") if x.strip()]
                 else:
                     plot_dates = [x.strip() for x in s.split(",") if x.strip()]
@@ -725,7 +812,7 @@ class Evaluator:
             depth_round_decimals=int(self.depth_round_decimals),
         )
 
-    def _bl_init_state(self, save_dir: str, bl_cfg: "_BLConfig"):
+    def _bl_init_state(self, save_dir: str, bl_cfg: "_BLConfig") -> "_BLState":
         out_dir = None
         if bl_cfg.enabled:
             out_dir = os.path.join(save_dir, "BL")
@@ -766,6 +853,7 @@ class Evaluator:
 
         sample_start = str(dt64[~is_nat].min())[:10]
 
+        # capture one sample for Plot 1
         if bl_cfg.start_date is not None and bl_state.selected_sample is None:
             if bl_cfg.start_date == sample_start:
                 bl_state.selected_sample = {
@@ -798,7 +886,7 @@ class Evaluator:
             att_map = {float(d): float(v) for d, v, vid in zip(depths_r, preds, vids) if int(vid) == bl_cfg.att_var_id}
             common_depths = sorted(set(chla_map.keys()) & set(att_map.keys()))
 
-            # If provided explicit plot dates, collect a profile for those dates across the entire eval stream.
+            # If user provided explicit plot dates, collect a profile for those dates across the entire eval stream.
             if bl_cfg.plot_dates is not None and day in set(bl_cfg.plot_dates):
                 if day not in bl_state.profiles_by_date and len(common_depths) > 0:
                     bl_state.profiles_by_date[day] = {
@@ -1006,6 +1094,14 @@ class Evaluator:
     def compute_nll_loss(self, forecasts, targets, mask=None):
         """
         Compute Negative Log Likelihood loss for Student-t distribution.
+        
+        Args:
+            forecasts: Dict with 'distribution' key containing StudentT distribution
+            targets: Ground truth values (B, S_t)
+            mask: Optional mask for valid predictions (B, S_t)
+            
+        Returns:
+            NLL loss
         """
         if isinstance(forecasts, dict) and 'distribution' in forecasts:
             # Probabilistic forecasting case
@@ -1029,13 +1125,31 @@ class Evaluator:
                 return F.mse_loss(forecasts, targets)
 
     def forecasting_loss(self, seq_Y, pred, mask_out, epoch=0):
+        """
+        Compute forecasting loss (prediction loss) without contrastive learning.
+        This is a simplified version of the combined_loss from trainer.py.
+        
+        Args:
+            seq_Y: Ground truth targets (B, S_t)
+            pred: Model predictions (dict with 'distribution' or tensor)
+            mask_out: Mask for valid predictions (B, S_t)
+            epoch: Current epoch (for compatibility)
+            
+        Returns:
+            total_loss: Combined forecasting + regularization loss
+            forecasting_loss: Pure forecasting loss
+            reg_loss: Regularization loss
+        """
+        # Use NLL loss for probabilistic forecasting, MSE for fallback
         forecasting_loss = self.compute_nll_loss(forecasts=pred, targets=seq_Y, mask=mask_out)
 
+        # Add Student-t parameter regularizers if probabilistic forecasting
         reg_loss = 0.0
         if isinstance(pred, dict) and 'scale' in pred and 'df' in pred:
             scale = pred['scale']  # (B, S_t)
             df = pred['df']  # (B, S_t)
             
+            # Apply mask to parameters if available
             if mask_out is not None:
                 valid_scale = scale[mask_out.bool()]
                 valid_df = df[mask_out.bool()]
@@ -1043,12 +1157,16 @@ class Evaluator:
                 valid_scale = scale
                 valid_df = df
             
+            # Scale regularization: L2 on log(scale) to prevent runaway scales
             if self.reg_scale_weight > 0:
+                # Ensure scale values are positive before taking log
                 valid_scale_safe = torch.clamp(valid_scale, min=1e-6)
                 reg_scale = self.reg_scale_weight * torch.mean(torch.log(valid_scale_safe) ** 2)
                 reg_loss += reg_scale
             
+            # Degrees of freedom regularization: L2 on (df - df_target)
             if self.reg_df_weight > 0:
+                # Regularize (df - df_target)
                 reg_df = self.reg_df_weight * torch.mean((valid_df - self.df_target) ** 2)
                 reg_loss += reg_df
         
@@ -1066,10 +1184,23 @@ class Evaluator:
         lake_id_to_scalers=None,
         lake_id_to_depth_minmax=None,
     ):
+        """
+        Runs one pass of evaluation, streaming predictions and labels into a single HDF5 file to avoid large memory usage.
+
+        Returns:
+            - global masked MSE ('loss')
+            - mse_by_lake:    { lake_id -> masked MSE }
+            - mse_by_variate: { variate_id -> masked MSE }
+        """
         num_plot_batches=self.cfg.num_plot_batches
         os.makedirs(save_dir, exist_ok=True)
 
         def _to_int_lake_id(x):
+            """
+            Robustly coerce a lake id to int.
+            Handles torch/numpy scalars, strings like "1", and bytes.
+            Falls back to returning `x` unchanged if conversion fails.
+            """
             try:
                 if isinstance(x, (torch.Tensor, np.ndarray)) and np.ndim(x) == 0:
                     x = x.item()
@@ -1090,12 +1221,14 @@ class Evaluator:
             if lake_id_to_scalers is None:
                 return None
             lake_id_int = _to_int_lake_id(lake_id)
+            # Prefer stable int key lookup, but keep backward compatibility if dict was keyed by str.
             scalers = lake_id_to_scalers.get(lake_id_int, None)
             if scalers is None:
                 scalers = lake_id_to_scalers.get(str(lake_id_int), None)
             return scalers
 
         # Depth de-normalization helper: dataset normalizes depth to [0, 1] per lake.
+        # For JSON depth-wise metrics we want *actual depth in meters* as keys.
         def denormalize_depths_for_lake(depth_vals: torch.Tensor, lake_id) -> torch.Tensor:
             if lake_id_to_depth_minmax is None:
                 return depth_vals
@@ -1127,6 +1260,10 @@ class Evaluator:
             thermo_state = self._thermo_init_state(save_dir=save_dir, cfg=thermo_cfg)
 
         def _depth_key(depth_val: float) -> str:
+            """
+            Returns a stable JSON-friendly depth key.
+            If self.depth_bin_size_m is set, we bucket into [lo, hi) bins; else we round to depth_round_decimals.
+            """
             if self.depth_bin_size_m is not None and self.depth_bin_size_m > 0:
                 lo = math.floor(depth_val / self.depth_bin_size_m) * self.depth_bin_size_m
                 hi = lo + self.depth_bin_size_m
@@ -1162,19 +1299,33 @@ class Evaluator:
         lake_embed_traj_lake_names = []  # List of corresponding lake names
 
 
-        lake_preds, lake_labels   = defaultdict(list), defaultdict(list)        
+        lake_preds, lake_labels   = defaultdict(list), defaultdict(list)
+        # Variate-wise metrics are computed directly in the main loop, no need for separate storage
+        
+        # Initialize metrics accumulators
         mse_sum = 0.0
         mae_sum = 0.0
         crps_sum = 0.0
         crps_count = 0
 
+        # --- T+N date×horizon accumulators (variate-level; union across depths) ---
+        # We keep these as sums+counts so duplicates (e.g., multiple depths) are averaged per cell.
+        # Structure:
+        #   tplusn_acc[var_id][date] = {pred_sum,pred_cnt,gt_sum,gt_cnt} where each is length=max_horizon.
         max_horizon = int(getattr(self.cfg.evaluator, "tplusn_max_horizon", 14))
+        # If unset, we compute for all variates observed in Y; you can restrict via cfg.evaluator.tplusn_var_ids.
         tplusn_var_ids_cfg = getattr(self.cfg.evaluator, "tplusn_var_ids", None)
         tplusn_target_var_ids = None
         if tplusn_var_ids_cfg is not None:
             tplusn_target_var_ids = [int(v) for v in list(tplusn_var_ids_cfg)]
         tplusn_acc = defaultdict(dict)
 
+        # WQL accumulators (overall + per-lake). WQL is computed from quantile (pinball) loss:
+        #   WQL(q) = 2 * sum_t pinball_q(y_t, yhat_q,t) / (sum_t |y_t| + eps)
+        # and averaged across quantiles.
+        #
+        # We compute quantiles analytically for Student-t via PPF (inverse CDF) if available, else fall back
+        # to an MC quantile estimate (approximation) as a last resort.
         default_wql_quantiles = [
             0.01, 0.05, 0.10, 0.15, 0.20, 0.25, 0.30, 0.35, 0.40, 0.45,
             0.50,
@@ -1194,6 +1345,7 @@ class Evaluator:
         wql_denom_sum = 0.0
         lake_wql_pinball_sums = defaultdict(lambda: [0.0 for _ in wql_quantiles])
         lake_wql_denom_sums = defaultdict(float)
+        # Var-wise WQL accumulators (overall per variable, and per-lake per-variable)
         var_wql_pinball_sums = defaultdict(lambda: [0.0 for _ in wql_quantiles])
         var_wql_denom_sums = defaultdict(float)
         lake_var_wql_pinball_sums = defaultdict(lambda: defaultdict(lambda: [0.0 for _ in wql_quantiles]))
@@ -1202,44 +1354,127 @@ class Evaluator:
         metric_count = 0
         saw_distribution = False
 
+        # Token counts for weighted/unweighted aggregation
+        # NOTE: counts represent number of valid target tokens (after masks), not number of lake "samples".
         lake_token_counts = defaultdict(int)
 
+        # Lake-wise CRPS accumulators (computed from distribution samples during the main loop)
         lake_crps_sums = defaultdict(float)
         lake_crps_counts = defaultdict(int)
         
+        # Initialize variate-wise metrics accumulators (for irregular grids, no 2D/1D distinction)
         var_mse_sums = defaultdict(float)
         var_mae_sums = defaultdict(float)
         var_crps_sums = defaultdict(float)
         var_counts = defaultdict(int)
 
+        # Initialize per-lake per-variate accumulators
         lake_var_mse_sums = defaultdict(lambda: defaultdict(float))
         lake_var_mae_sums = defaultdict(lambda: defaultdict(float))
         lake_var_crps_sums = defaultdict(lambda: defaultdict(float))
         lake_var_counts = defaultdict(lambda: defaultdict(int))
 
+        # Depth-wise (per lake, per variate, per depth/bin) accumulators
         lake_var_depth_mse_sums = defaultdict(lambda: defaultdict(lambda: defaultdict(float)))
         lake_var_depth_mae_sums = defaultdict(lambda: defaultdict(lambda: defaultdict(float)))
         lake_var_depth_crps_sums = defaultdict(lambda: defaultdict(lambda: defaultdict(float)))
         lake_var_depth_counts = defaultdict(lambda: defaultdict(lambda: defaultdict(int)))
+        # Depth-wise (per lake, aggregated across variates, per depth/bin) accumulators
         lake_depth_mse_sums = defaultdict(lambda: defaultdict(float))
         lake_depth_mae_sums = defaultdict(lambda: defaultdict(float))
         lake_depth_crps_sums = defaultdict(lambda: defaultdict(float))
         lake_depth_counts = defaultdict(lambda: defaultdict(int))
         
+        # Track unique variables per lake across all batches (for debugging)
         lake_to_variates = defaultdict(set)
 
+        # For irregular data, collect all data first, then pad and save
+        # Group data by lake_id for separate saving
         collected_data_by_lake = defaultdict(list)  # {lake_id: [data_map1, data_map2, ...]}
         total_loss = 0.0
         n_batches = len(dataloader)
         self.model.eval()
+        device_obj = torch.device(self.device)
+        infer_step_time_s = 0.0
+        infer_samples = 0
+        infer_valid_tokens = 0
+        # Peak VRAM during model forward only (per-batch reset_peak + max across batches).
+        infer_forward_peak_vram_gb = 0.0
         
+        # For irregular data, collect all data first, then pad and save
         collected_data = []
         
+        # Track lake names for later use in saving
         lake_id_to_name_all = {}
 
         if self.rank == 0:
             pbar = tqdm(total=n_batches, desc=f"Eval trial {trial_idx}", unit='batch')
+        #
+        # Requested structure (minimal):
+        #   sample_<id>: {
+        #     "dates": [YYYY-MM-DD, ...],
+        #     "variates": {
+        #       "<variable_name>": {
+        #         "mean": {"depth_<m>": [..], ...},
+        #         "std":  {"depth_<m>": [..], ...}
+        #       }, ...
+        #     }
+        #   }
+        # Always write per-sample predictions JSON (rank 0 only) to a deterministic path under save_dir.
+        # Write per-sample predictions as JSONL (one JSON object per line) to avoid building one huge JSON
+        # and to keep the file valid if the run stops mid-way.
+        sample_pred_fh = None
+        sample_pred_written = 0
+        sample_pred_path = None
+        # Also write per-sample ground-truth as JSONL in the same schema to a separate file.
+        sample_gt_fh = None
+        sample_gt_written = 0
+        sample_gt_path = None
+        if self.rank == 0:
+            sample_pred_path = os.path.join(save_dir, f"sample_predictions_trial_{trial_idx}.jsonl")
+            sample_pred_fh = open(sample_pred_path, "w")
+            sample_gt_path = os.path.join(save_dir, f"sample_ground_truth_trial_{trial_idx}.jsonl")
+            sample_gt_fh = open(sample_gt_path, "w")
 
+        def _day_key(dt_val) -> str:
+            """Return YYYY-MM-DD key from datetime-like input; '' if invalid/padding."""
+            try:
+                if isinstance(dt_val, np.datetime64):
+                    if np.isnat(dt_val):
+                        return ""
+                    return str(np.datetime_as_string(dt_val, unit="D"))
+                if isinstance(dt_val, (bytes, bytearray)):
+                    dt_val = dt_val.decode("utf-8")
+                s = str(dt_val).strip()
+                if s == "" or s.lower() == "nat":
+                    return ""
+                # Handle numeric epoch timestamps (common in some exports).
+                # Heuristic: seconds ~ 1e9, ms ~ 1e12, us ~ 1e15, ns ~ 1e18.
+                if re.fullmatch(r"[-+]?\d+(\.\d+)?", s):
+                    x = float(s)
+                    ax = abs(x)
+                    if ax >= 1e17:
+                        ts = pd.to_datetime(int(x), unit="ns", utc=True, errors="coerce")
+                    elif ax >= 1e14:
+                        ts = pd.to_datetime(int(x), unit="us", utc=True, errors="coerce")
+                    elif ax >= 1e11:
+                        ts = pd.to_datetime(int(x), unit="ms", utc=True, errors="coerce")
+                    else:
+                        ts = pd.to_datetime(int(x), unit="s", utc=True, errors="coerce")
+                else:
+                    ts = pd.to_datetime(s, utc=True, errors="coerce")
+                if pd.isna(ts):
+                    return s[:10]
+                ts = pd.Timestamp(ts)
+                if ts.tzinfo is not None:
+                    ts = ts.tz_convert("UTC").tz_localize(None)
+                return ts.normalize().date().isoformat()
+            except Exception:
+                try:
+                    return str(dt_val)[:10]
+                except Exception:
+                    return ""
+        # breakpoint()
         for iteration, sample in enumerate(dataloader):
             seq_X = sample["flat_seq_x"].to(self.device)
             mask_X = sample["flat_mask_x"].to(self.device) 
@@ -1256,12 +1491,8 @@ class Evaluator:
             num_2d_vars = sample['num2Dvars']
             num_1d_vars = sample['num1Dvars']
             num_depths = sample['num_depths']
-            
-            has_tgt_grid = all(
-                k in sample
-                for k in ("tgt_variate_ids", "tgt_time_values", "tgt_time_ids", "tgt_depth_values", "tgt_padding_mask")
-            )
 
+            # target data
             seq_Y = sample["flat_seq_y"].to(self.device)
             mask_Y = sample["flat_mask_y"].to(self.device)
             sample_ids_y = sample["sample_ids_y"].to(self.device)
@@ -1281,6 +1512,7 @@ class Evaluator:
             B = seq_Y.shape[0]
             for b in range(B):
                 lake_id_b = int(lake_ids[b])
+                # Get valid variates from target (what we're evaluating)
                 valid_mask = mask_out[b].bool()
                 if valid_mask.any():
                     valid_var_ids = var_ids_y[b][valid_mask]
@@ -1289,124 +1521,124 @@ class Evaluator:
                         var_id_int = int(var_id)
                         lake_to_variates[lake_id_b].add(var_id_int)
 
+            # Skip iteration if the whole batch has no valid values
             if not mask_X.any():
                 if self.rank == 0:
                     pbar.update(1)
                 continue
             
             model_ref = self.model.module if hasattr(self.model, "module") else self.model
-            # forward + loss
-            with torch.autocast(device_type='cuda'):
-                tgt_variate_ids = var_ids_y
-                tgt_time_values = time_values_y
-                tgt_time_ids = time_ids_y
-                tgt_depth_values = depth_values_y
-                tgt_padding_mask = padding_mask_y.bool()
-                
-                x_enc, pred, z = model_ref(data=seq_X,
-                                             observed_mask=mask_X,
-                                             sample_ids=sample_ids_x,
-                                             variate_ids=var_ids_x,
-                                             padding_mask=padding_mask_x,
-                                             depth_values=depth_values_x,
-                                             pred_len=self.pred_len,
-                                             seq_len=self.seq_len,
-                                             time_values=time_values_x,
-                                             time_ids=time_ids_x,
-                                             tgt_variate_ids=tgt_variate_ids,
-                                             tgt_time_values=tgt_time_values,
-                                             tgt_time_ids=tgt_time_ids,
-                                             tgt_depth_values=tgt_depth_values,
-                                             tgt_padding_mask=tgt_padding_mask)
-                # Always use irregular ground truth for loss computation
-                pred_loss, forecasting_loss, reg_loss = self.forecasting_loss(seq_Y=seq_Y, 
-                                                                               pred=pred, 
-                                                                               mask_out=mask_out, 
-                                                                               epoch=self.model_epoch)
-                
-                # Extract lake embedding trajectories if enabled
-                if self.lake_embed_traj:
-                    # x_enc is already z_temporal_tokens (B, S, d_temporal) from model forward
-                    # Model returns: z_temporal_tokens, forecasts, z
-                    z_temporal_tokens = x_enc  # Already projected to d_temporal
-                    
-                    # Apply mean pooling over valid tokens (using padding_mask_x)
-                    valid_mask = padding_mask_x.bool()  # (B, S)
-                    masked_temporal = z_temporal_tokens * valid_mask.unsqueeze(-1)  # (B, S, d_temporal)
-                    pooled_temporal = torch.sum(masked_temporal, dim=1) / torch.sum(valid_mask, dim=1, keepdim=True)  # (B, d_temporal)
-                    
-                    # Extract last date from context window for each sample
-                    B = seq_X.shape[0]
-                    datetime_x = sample["datetime_strs_x"]
-                    
-                    for b in range(B):
-                        # Get valid mask for this sample
-                        valid_mask_b = valid_mask[b]  # (S,)
-                        if not valid_mask_b.any():
+            tgt_variate_ids = var_ids_y
+            tgt_time_values = time_values_y
+            tgt_time_ids = time_ids_y
+            tgt_depth_values = depth_values_y
+            tgt_padding_mask = padding_mask_y.bool()
+
+            # Throughput / VRAM: model forward only (excludes loss, CRPS/WQL, etc.).
+            infer_samples += int(seq_X.shape[0])
+            infer_valid_tokens += int(mask_out.sum().item())
+            if torch.cuda.is_available():
+                torch.cuda.synchronize(device_obj)
+                torch.cuda.reset_peak_memory_stats(device_obj)
+            infer_t0 = dt.now().timestamp()
+            with torch.inference_mode(), torch.autocast(device_type='cuda'):
+                x_enc, pred, z = model_ref(
+                    data=seq_X,
+                    observed_mask=mask_X,
+                    sample_ids=sample_ids_x,
+                    variate_ids=var_ids_x,
+                    padding_mask=padding_mask_x,
+                    depth_values=depth_values_x,
+                    pred_len=self.pred_len,
+                    seq_len=self.seq_len,
+                    time_values=time_values_x,
+                    time_ids=time_ids_x,
+                    tgt_variate_ids=tgt_variate_ids,
+                    tgt_time_values=tgt_time_values,
+                    tgt_time_ids=tgt_time_ids,
+                    tgt_depth_values=tgt_depth_values,
+                    tgt_padding_mask=tgt_padding_mask,
+                )
+            if torch.cuda.is_available():
+                torch.cuda.synchronize(device_obj)
+                infer_forward_peak_vram_gb = max(
+                    infer_forward_peak_vram_gb,
+                    float(torch.cuda.max_memory_allocated(device_obj) / (1024 ** 3)),
+                )
+            infer_step_time_s += dt.now().timestamp() - infer_t0
+
+            pred_loss, forecasting_loss, reg_loss = self.forecasting_loss(
+                seq_Y=seq_Y,
+                pred=pred,
+                mask_out=mask_out,
+                epoch=self.model_epoch,
+            )
+
+            # Extract lake embedding trajectories if enabled
+            if self.lake_embed_traj:
+                # x_enc is already z_temporal_tokens (B, S, d_temporal) from model forward
+                # Model returns: z_temporal_tokens, forecasts, z
+                z_temporal_tokens = x_enc  # Already projected to d_temporal
+
+                # Apply mean pooling over valid tokens (using padding_mask_x)
+                valid_mask = padding_mask_x.bool()  # (B, S)
+                masked_temporal = z_temporal_tokens * valid_mask.unsqueeze(-1)  # (B, S, d_temporal)
+                pooled_temporal = torch.sum(masked_temporal, dim=1) / torch.sum(valid_mask, dim=1, keepdim=True)  # (B, d_temporal)
+
+                # Extract last date from context window for each sample
+                B = seq_X.shape[0]
+                datetime_x = sample["datetime_strs_x"]
+
+                for b in range(B):
+                    # Get valid mask for this sample
+                    valid_mask_b = valid_mask[b]  # (S,)
+                    if not valid_mask_b.any():
+                        continue
+
+                    # Get last valid datetime string for this sample
+                    datetime_x_b = datetime_x[b]  # typically numpy datetime64[ns] array (may contain NaT)
+                    valid_indices = torch.where(valid_mask_b)[0].detach().cpu().numpy()
+
+                    # Select the last valid index whose datetime is not NaT (NaT breaks DOY/date coloring)
+                    try:
+                        dt_arr = np.array(datetime_x_b)
+                        # Guard against mismatch in lengths
+                        valid_indices = valid_indices[valid_indices < len(dt_arr)]
+                        if valid_indices.size == 0:
                             continue
-                        
-                        # Get last valid datetime string for this sample
-                        datetime_x_b = datetime_x[b]  # typically numpy datetime64[ns] array (may contain NaT)
-                        valid_indices = torch.where(valid_mask_b)[0].detach().cpu().numpy()
+                        dt_valid = dt_arr[valid_indices]
+                        if np.issubdtype(dt_valid.dtype, np.datetime64):
+                            non_nat = ~np.isnat(dt_valid)
+                        else:
+                            # String/object fallback: treat empty/NaT strings as invalid
+                            dt_valid_str = dt_valid.astype(str)
+                            non_nat = (dt_valid_str != "NaT") & (dt_valid_str != "") & (dt_valid_str != "None")
 
-                        # Select the last valid index whose datetime is not NaT (NaT breaks DOY/date coloring)
-                        try:
-                            dt_arr = np.array(datetime_x_b)
-                            valid_indices = valid_indices[valid_indices < len(dt_arr)]
-                            if valid_indices.size == 0:
-                                continue
-                            dt_valid = dt_arr[valid_indices]
-                            if np.issubdtype(dt_valid.dtype, np.datetime64):
-                                non_nat = ~np.isnat(dt_valid)
-                            else:
-                                dt_valid_str = dt_valid.astype(str)
-                                non_nat = (dt_valid_str != "NaT") & (dt_valid_str != "") & (dt_valid_str != "None")
+                        candidate = valid_indices[non_nat]
+                        if candidate.size == 0:
+                            # No usable datetime for this sample; skip storing this trajectory point
+                            continue
+                        last_valid_idx = int(candidate[-1])
+                        last_date_val = dt_arr[last_valid_idx]
+                        if isinstance(last_date_val, np.datetime64):
+                            last_date = np.datetime_as_string(last_date_val, unit="s")
+                        else:
+                            last_date = str(last_date_val)
+                    except Exception:
+                        # Fallback: keep previous behavior (may yield NaT)
+                        valid_indices_t = torch.where(valid_mask_b)[0]
+                        last_valid_idx = min(valid_indices_t[-1].item(), len(datetime_x_b) - 1)
+                        if last_valid_idx < 0 or last_valid_idx >= len(datetime_x_b):
+                            continue
+                        last_date = str(datetime_x_b[last_valid_idx])
 
-                            candidate = valid_indices[non_nat]
-                            if candidate.size == 0:
-                                continue
-                            last_valid_idx = int(candidate[-1])
-                            last_date_val = dt_arr[last_valid_idx]
-                            if isinstance(last_date_val, np.datetime64):
-                                last_date = np.datetime_as_string(last_date_val, unit="s")
-                            else:
-                                last_date = str(last_date_val)
-                        except Exception:
-                            valid_indices_t = torch.where(valid_mask_b)[0]
-                            last_valid_idx = min(valid_indices_t[-1].item(), len(datetime_x_b) - 1)
-                            if last_valid_idx < 0 or last_valid_idx >= len(datetime_x_b):
-                                continue
-                            last_date = str(datetime_x_b[last_valid_idx])
-                        
-                        lake_embed_traj_list.append(pooled_temporal[b].detach().cpu())
-                        lake_embed_traj_dates.append(last_date)
-                        lake_embed_traj_lake_ids.append(int(lake_ids[b]))
-                        lake_embed_traj_lake_names.append(lake_names[b])
+                    # Store pooled embedding, date, and lake info
+                    lake_embed_traj_list.append(pooled_temporal[b].detach().cpu())
+                    lake_embed_traj_dates.append(last_date)
+                    lake_embed_traj_lake_ids.append(int(lake_ids[b]))
+                    lake_embed_traj_lake_names.append(lake_names[b])
 
-            pred_grid = None
-            if self.regular_grid_forecasting and has_tgt_grid:
-                try:
-                    with torch.no_grad(), torch.autocast(device_type='cuda'):
-                        _, pred_grid, _ = model_ref(
-                            data=seq_X,
-                            observed_mask=mask_X,
-                            sample_ids=sample_ids_x,
-                            variate_ids=var_ids_x,
-                            padding_mask=padding_mask_x,
-                            depth_values=depth_values_x,
-                            pred_len=self.pred_len,
-                            seq_len=self.seq_len,
-                            time_values=time_values_x,
-                            time_ids=time_ids_x,
-                            tgt_variate_ids=sample["tgt_variate_ids"].to(self.device),
-                            tgt_time_values=sample["tgt_time_values"].to(self.device),
-                            tgt_time_ids=sample["tgt_time_ids"].to(self.device),
-                            tgt_depth_values=sample["tgt_depth_values"].to(self.device),
-                            tgt_padding_mask=sample["tgt_padding_mask"].to(self.device).bool(),
-                        )
-                except Exception:
-                    pred_grid = None
-
+            # Log loss components for monitoring (every 10 batches)
             if self.rank == 0 and iteration % 10 == 0:
                 print(f"Batch {iteration}: total_loss={pred_loss.item():.6f}, "
                       f"forecasting_loss={forecasting_loss.item():.6f}, "
@@ -1415,7 +1647,9 @@ class Evaluator:
             loss_value = pred_loss.item()
             batch_loss += loss_value
             
+            # ---------------- Metrics: MSE, MAE, CRPS (+ depth-wise) ----------------
             with torch.no_grad():
+                # Always use irregular ground truth for metrics computation
                 valid_mask_bool = mask_out.bool()
                 
                 if isinstance(pred, dict) and 'distribution' in pred:
@@ -1425,6 +1659,7 @@ class Evaluator:
                     pred_mean_tensor = pred
                     dist_obj = None
 
+                # Draw CRPS Monte Carlo samples once per batch (if probabilistic)
                 samples = None
                 K = 16
                 if dist_obj is not None:
@@ -1447,18 +1682,24 @@ class Evaluator:
                     yhat_valid = pred_mean_tensor[b][sample_mask]
                     var_ids_valid = var_ids_y[b][sample_mask]
                     time_ids_valid = time_ids_y[b][sample_mask]
+                    # Align datetime strings with the same valid mask (list[str] or numpy array-like)
                     dt_y_row = datetime_y[b]
                     mask_np = sample_mask.detach().cpu().numpy().astype(bool)
                     dt_valid = list(np.array(dt_y_row, dtype=object)[mask_np])
 
+                    # depth_values_y is normalized to [0,1] per lake; convert to meters for depth-wise metrics
                     depth_valid = denormalize_depths_for_lake(depth_values_y[b][sample_mask], lake_id_b)
+                    # datetime for each token (numpy datetime64); align with the same valid mask
                     dt_row = None
                     if (self.rank == 0) and (self.BL or (thermo_cfg is not None and thermo_cfg.enabled)):
                         try:
+                            # datetime_y is (B, T) numpy datetime64 array from collate_fn padding
                             dt_row = datetime_y[b]
+                            # Align with the same mask positions in the original sequence length
                             dt_row = dt_row[sample_mask.detach().cpu().numpy()]
                         except Exception:
                             dt_row = None
+                    # Denormalize per-lake (required because scalers are lake-specific)
                     if self.denorm_eval and scalers is not None:
                         y_valid = Normalizer.denormalize_by_var_ids(
                         y_valid, var_ids_valid,
@@ -1474,6 +1715,10 @@ class Evaluator:
                     if y_valid.numel() == 0:
                         continue
 
+                    # --- T+N date×horizon matrix accumulation (variate-level; union across depths) ---
+                    # IMPORTANT: `time_ids_*` are relative to the *window start* on a regular daily grid.
+                    # So the correct origin for T+1..T+pred_len is the *end of the context window*,
+                    # not the last observed context token (which may be earlier if observations are sparse).
                     context_len_days = 30
                     origin_time_id = int(context_len_days) - 1
                     if origin_time_id >= 0:
@@ -1494,8 +1739,10 @@ class Evaluator:
                                 max_horizon=max_horizon,
                             )
 
-                    # ------- WQL ----------------
-
+                    # ---------------- WQL ----------------
+                    # Note: we normalize by sum |y| to make WQL scale-invariant (common definition).
+                    #       We also guard against non-finite params/targets.
+                    # Filter to finite tokens for WQL computation
                     finite_mask = torch.isfinite(y_valid) & torch.isfinite(yhat_valid)
                     if finite_mask.any():
                         y_w = y_valid[finite_mask]
@@ -1514,6 +1761,14 @@ class Evaluator:
                             lake_var_wql_denom_sums[lake_id_b][vid_int] += d_v
 
                     def _std_student_t_ppf(df_tensor: torch.Tensor, q: float):
+                        """
+                        Return the *standardized* Student-t quantile t_q for each df in df_tensor.
+                        Priority:
+                          1) torch.special.stdtrit (fast, on-device)
+                          2) scipy.stats.t.ppf (robust, CPU)  <-- preferred fallback
+                          3) torch.distributions.StudentT.icdf (may be unavailable/unsupported)
+                        Returns None only if all methods fail.
+                        """
                         qf = float(q)
                         q_tensor = torch.full_like(df_tensor, qf)
 
@@ -1524,17 +1779,21 @@ class Evaluator:
                             except Exception:
                                 pass
 
+                        # Robust fallback: SciPy PPF on CPU
                         try:
                             from scipy import stats as _scipy_stats  # local import to avoid hard dependency at import-time
 
                             df_np = df_tensor.detach().to("cpu").numpy()
+                            # scipy supports array df with scalar q
                             tq_np = _scipy_stats.t.ppf(qf, df_np)
                             tq = torch.as_tensor(tq_np, device=df_tensor.device, dtype=df_tensor.dtype)
                             if torch.isfinite(tq).all():
                                 return tq
+                            # If SciPy returned inf/nan for some df, fall through to torch icdf / None.
                         except Exception:
                             pass
 
+                        # Analytic/numerical fallback: use StudentT.icdf if available in this torch build.
                         try:
                             d = torch.distributions.StudentT(
                                 df=df_tensor,
@@ -1545,6 +1804,7 @@ class Evaluator:
                         except Exception:
                             return None
 
+                    # Build quantile predictions
                     if (dist_obj is not None) and isinstance(pred, dict) and all(k in pred for k in ("loc", "scale", "df")):
                         loc_w = pred["loc"][b][sample_mask][finite_mask]
                         scale_w = pred["scale"][b][sample_mask][finite_mask]
@@ -1563,6 +1823,7 @@ class Evaluator:
                                 variate_ids_2D=scalers["variate_ids_2D"],
                             )
 
+                        # clamp to valid parameter domain
                         df_w = torch.clamp(df_w, min=1e-3)
                         scale_w = torch.clamp(scale_w, min=1e-12)
                         param_finite = torch.isfinite(loc_w) & torch.isfinite(scale_w) & torch.isfinite(df_w)
@@ -1576,7 +1837,12 @@ class Evaluator:
                             for qi, q in enumerate(wql_quantiles):
                                 t_q = _std_student_t_ppf(df_wp, q)
                                 if t_q is None:
+                                    # Last resort: approximate quantile via MC sampling (quantile of samples)
                                     if not warned_wql_ppf_fallback and self.rank == 0:
+                                        print(
+                                            "Warning: Student-t PPF unavailable (torch.special.stdtrit missing/failed; SciPy PPF failed; StudentT.icdf failed). "
+                                            f"Falling back to MC quantiles for WQL with {wql_mc_samples} samples (approximation)."
+                                        )
                                         warned_wql_ppf_fallback = True
                                     try:
                                         dist_tokens = torch.distributions.StudentT(df=df_wp, loc=loc_wp, scale=scale_wp)
@@ -1652,13 +1918,14 @@ class Evaluator:
                         lake_crps_sums[lake_id_b] += crps_tokens.sum().item()
                         lake_crps_counts[lake_id_b] += int(crps_tokens.numel())
 
+                    # BL update (rank 0 only) – keep it separate from core metric computation.
                     if self.BL and bl_cfg.enabled and dt_row is not None:
                         try:
                             self._bl_update(
                                 bl_cfg,
                                 bl_state,
                                 lake_id=lake_id_b,
-                                lake_name=(lake_names[b] if isinstance(lake_names, list) else None),
+                                lake_name=lake_names[b],
                                 dt_row=np.array(dt_row, dtype="datetime64[ns]"),
                                 depth_m=depth_valid.detach().cpu().numpy(),
                                 var_ids=var_ids_valid.detach().cpu().numpy(),
@@ -1667,13 +1934,14 @@ class Evaluator:
                         except Exception:
                             pass
 
+                    # Thermocline update (rank 0 only) – uses full eval stream, filtered by start/end date.
                     if thermo_cfg is not None and thermo_state is not None and dt_row is not None:
                         try:
                             self._thermo_update(
                                 thermo_cfg,
                                 thermo_state,
                                 lake_id=lake_id_b,
-                                lake_name=(lake_names[b] if isinstance(lake_names, list) else None),
+                                lake_name=lake_names[b],
                                 dt_row=np.array(dt_row, dtype="datetime64[ns]"),
                                 depth_m=depth_valid.detach().cpu().numpy(),
                                 var_ids=var_ids_valid.detach().cpu().numpy(),
@@ -1686,6 +1954,8 @@ class Evaluator:
                     # Variate-wise and depth-wise metrics on flattened tokens
                     unique_vars = torch.unique(var_ids_valid)
 
+                    # Depth-wise metrics aggregated across all variates (within this lake)
+                    # Group by depth/bin on the full token set for this sample.
                     if depth_valid.numel() > 0:
                         if self.depth_bin_size_m is not None and self.depth_bin_size_m > 0:
                             depth_grp_all = torch.floor(depth_valid / self.depth_bin_size_m) * self.depth_bin_size_m
@@ -1737,6 +2007,7 @@ class Evaluator:
                             var_crps_sums[var_id_int] += crps_val
                             lake_var_crps_sums[lake_id_b][var_id_int] += crps_val
 
+                        # Group by (variate, depth/bin) within this lake
                         depth_vals_v = depth_valid[var_mask]
                         if depth_vals_v.numel() > 0:
                             if self.depth_bin_size_m is not None and self.depth_bin_size_m > 0:
@@ -1760,36 +2031,46 @@ class Evaluator:
                                 lake_var_depth_counts[lake_id_b][var_id_int][dk] += c_d
 
                                 if crps_tokens is not None:
+                                    # Align depth grouping with the same tokens used above
                                     crps_v = crps_tokens[var_mask]
                                     lake_var_depth_crps_sums[lake_id_b][var_id_int][dk] += crps_v[dg_mask].sum().item()
 
             if not math.isfinite(loss_value):
                 if self.rank==0:
                     print("Loss is {}, stopping validation".format(loss_value))
+ 
+            # (variates/depth-wise metrics handled above inside the unified metrics block)
 
+            # Store full prediction distribution for uncertainty visualization
             if isinstance(pred, dict) and 'distribution' in pred:
+                # Store full distribution parameters
                 pred_to_store = {
-                    'loc': pred['loc'].detach(),
-                    'scale': pred['scale'].detach(),
-                    'df': pred['df'].detach(),
-                    'mean': pred['distribution'].mean.detach()
+                    'loc': pred['loc'].detach().clone(),
+                    'scale': pred['scale'].detach().clone(),
+                    'df': pred['df'].detach().clone(),
+                    'mean': pred['distribution'].mean.detach().clone()
                 }
             else:
-                pred_to_store = pred.detach()
+                pred_to_store = pred.detach().clone()
             
+            # Only collect plotting data for first num_plot_batches (similar to val_one_epoch)
+            # If num_plot_batches < 0 (e.g. -1), collect plotting data for the entire test loader.
             plot_all_batches = False
             try:
                 plot_all_batches = int(self.cfg.num_plot_batches) < 0
             except Exception:
                 plot_all_batches = False
             if (plot_all_batches or iteration < self.cfg.num_plot_batches) and self.rank == 0:
-                labels_denorm = seq_Y.detach()
+                # Denormalize plotting data if flag is set (only mean and labels)
+                labels_denorm = seq_Y.detach().clone()
                 if self.denorm_eval:
+                    # Handle batched data - denormalize per sample in batch
                     B = seq_Y.shape[0]
                     for b in range(B):
                         lake_id_b = int(lake_ids[b])
                         scalers = get_scalers_for_lake(lake_id_b)
                         if scalers is not None:
+                            # Denormalize this sample's predictions
                             if isinstance(pred_to_store, dict):
                                 if 'mean' in pred_to_store:
                                     pred_to_store['mean'][b] = Normalizer.denormalize_by_var_ids(
@@ -1797,12 +2078,14 @@ class Evaluator:
                                         scaler_DF=scalers["scaler_DF"],
                                         variate_ids_2D=scalers["variate_ids_2D"]
                                     )[0]
+                                # Denormalize loc (location parameter) - same as mean
                                 if 'loc' in pred_to_store:
                                     pred_to_store['loc'][b] = Normalizer.denormalize_by_var_ids(
                                         pred_to_store['loc'][b:b+1], var_ids_y[b:b+1],
                                         scaler_DF=scalers["scaler_DF"],
                                         variate_ids_2D=scalers["variate_ids_2D"]
                                     )[0]
+                                # Denormalize scale (std) - only multiply by std, no mean shift
                                 if 'scale' in pred_to_store:
                                     pred_to_store['scale'][b] = Normalizer.denormalize_scale_by_var_ids(
                                         pred_to_store['scale'][b:b+1], var_ids_y[b:b+1],
@@ -1815,6 +2098,7 @@ class Evaluator:
                                     scaler_DF=scalers["scaler_DF"],
                                     variate_ids_2D=scalers["variate_ids_2D"]
                                 )[0]
+                            # Denormalize this sample's labels
                             labels_denorm[b] = Normalizer.denormalize_by_var_ids(
                                 labels_denorm[b:b+1], var_ids_y[b:b+1],
                                 scaler_DF=scalers["scaler_DF"],
@@ -1842,7 +2126,185 @@ class Evaluator:
                 datetime_list.append(datetime_y)
                 lake_names_list.append(lake_names)
                 lake_id_list.append(lake_ids)
-                
+
+                # Export per-sample predictions JSON (minimal format) for the same collected windows.
+                if sample_pred_fh is not None and sample_gt_fh is not None:
+                    try:
+                        B = int(seq_Y.shape[0])
+                        for b in range(B):
+                            # Sample id (prefer dataset idx)
+                            try:
+                                sid = idx[b]
+                                if isinstance(sid, (torch.Tensor, np.ndarray)) and np.ndim(sid) == 0:
+                                    sid = sid.item()
+                                sid = int(sid)
+                            except Exception:
+                                sid = int(b)
+
+                            # Pull token-aligned arrays for this sample
+                            dt_row = np.asarray(datetime_y[b], dtype=object)
+                            vids = var_ids_y[b].detach().cpu().numpy().astype(int)
+                            # Depths are already denormalized to meters in `depth_y_store` above (when min/max are available).
+                            depths_m = depth_y_store[b].detach().cpu().numpy().astype(float)
+                            eval_mask = mask_out[b].detach().cpu().numpy().astype(bool)
+                            
+                            if isinstance(pred_to_store, dict):
+                                mean_row = pred_to_store["mean"][b].detach().cpu().numpy().astype(float)
+                                std_row = pred_to_store.get("scale", None)
+                                std_row = std_row[b].detach().cpu().numpy().astype(float) if std_row is not None else None
+                            else:
+                                mean_row = pred_to_store[b].detach().cpu().numpy().astype(float)
+                                std_row = None
+                            # Ground-truth values (already denormalized if denorm_eval=True above)
+                            gt_row_vals = labels_denorm[b].detach().cpu().numpy().astype(float)
+
+                            # Choose token indices: valid prediction tokens (mask_out) with non-padding datetimes
+                            # IMPORTANT: For JSON export, we want ALL predictions (even where GT is NaN)
+                            # So we use padding_mask only, not eval_mask (which filters NaN GTs)
+                            # This ensures consistent depth/date grids for baseline comparison
+                            token_idx = []
+                            padding_mask_b = padding_mask_y[b].detach().cpu().numpy().astype(bool)
+                            for i in range(len(dt_row)):
+                                if not bool(padding_mask_b[i]):  # Only filter padding, not NaN
+                                    continue
+                                dk = _day_key(dt_row[i])
+                                if not dk:
+                                    continue
+                                token_idx.append(i)
+
+                            # Dates are constant across vars/depths; store once at sample level.
+                            dates = sorted({ _day_key(dt_row[i]) for i in token_idx if _day_key(dt_row[i]) })
+                            date_to_j = {d: j for j, d in enumerate(dates)}
+                            T = len(dates)
+                            
+                            # DEBUG: Check dates extraction
+                            # if sid < 3:
+                            #     print(f"  token_idx length: {len(token_idx)}")
+                            #     print(f"  Extracted dates (T): {T}")
+                            #     print(f"  dates: {dates[:5] if len(dates) > 5 else dates}")
+                            #     if T == len(set(dt_row)):
+                            #         print(f"  SUCCESS: All {T} dates exported!")
+                            #     elif T < len(set(dt_row)):
+                            #         print(f"  WARNING: Only {T} of {len(set(dt_row))} dates extracted!")
+                            #         # Show which dates are missing
+                            #         all_dates = sorted(set(_day_key(dt_row[i]) for i in range(len(dt_row)) if _day_key(dt_row[i])))
+                            #         exported_dates = set(dates)
+                            #         missing_dates = [d for d in all_dates if d not in exported_dates]
+                            #         if missing_dates:
+                            #             print(f"  Missing dates: {missing_dates[:5]}")
+                            if T == 0:
+                                continue
+
+                            # Aggregate values by (var, depth, date) (defensive against duplicates)
+                            acc = {}  # (vid, depth_key, date) -> [sum_mean, cnt_mean, sum_std, cnt_std]
+                            for i in token_idx:
+                                d = _day_key(dt_row[i])
+                                if d not in date_to_j:
+                                    continue
+                                vid = int(vids[i])
+                                dep = float(np.round(float(depths_m[i]), 6))
+                                k = (vid, dep, d)
+                                rec = acc.get(k)
+                                if rec is None:
+                                    rec = [0.0, 0, 0.0, 0]
+                                    acc[k] = rec
+                                mv = float(mean_row[i]) if np.isfinite(mean_row[i]) else None
+                                if mv is not None:
+                                    rec[0] += mv
+                                    rec[1] += 1
+                                if std_row is not None:
+                                    sv = float(std_row[i]) if np.isfinite(std_row[i]) else None
+                                    if sv is not None:
+                                        rec[2] += sv
+                                        rec[3] += 1
+
+                            # Build nested output: variate -> mean/std -> depth -> series
+                            variates_out = {}
+                            # Determine unique (vid, dep) pairs
+                            pairs = sorted({ (vid, dep) for (vid, dep, _d) in acc.keys() })
+                            for vid, dep in pairs:
+                                # Use variable name (preferred) instead of raw id
+                                vname = None
+                                try:
+                                    id_to_var = getattr(self, "id_to_var", None) or getattr(getattr(self, "data", None), "id_to_var", None)
+                                    if id_to_var is not None:
+                                        vname = id_to_var.get(int(vid), None)
+                                        if vname is None:
+                                            vname = id_to_var.get(str(int(vid)), None)
+                                except Exception:
+                                    vname = None
+                                vkey = str(vname) if vname is not None else f"var_{int(vid)}"
+                                dkey = f"depth_{float(dep):.6f}"
+                                vrec = variates_out.setdefault(vkey, {"mean": {}, "std": {}})
+                                mean_series = [None] * T
+                                std_series = [None] * T
+                                for d in dates:
+                                    rec = acc.get((vid, dep, d))
+                                    if rec is None:
+                                        continue
+                                    if rec[1] > 0:
+                                        mean_series[date_to_j[d]] = float(rec[0] / float(rec[1]))
+                                    if std_row is not None and rec[3] > 0:
+                                        std_series[date_to_j[d]] = float(rec[2] / float(rec[3]))
+                                vrec["mean"][dkey] = mean_series
+                                vrec["std"][dkey] = std_series
+
+                            sample_obj = {"dates": dates, "variates": variates_out}
+                            skey = f"sample_{sid}"
+                            sample_pred_fh.write(json.dumps({skey: sample_obj}, ensure_ascii=False) + "\n")
+                            sample_pred_written += 1
+
+                            # Build ground-truth object with the same schema (std = nulls)
+                            gt_variates_out = {}
+                            # Aggregate GT by (var, depth, date) (same mechanics as preds)
+                            gt_acc = {}  # (vid, depth_key, date) -> [sum, cnt]
+                            for i in token_idx:
+                                d = _day_key(dt_row[i])
+                                if d not in date_to_j:
+                                    continue
+                                vid = int(vids[i])
+                                dep = float(np.round(float(depths_m[i]), 6))
+                                k = (vid, dep, d)
+                                rec = gt_acc.get(k)
+                                if rec is None:
+                                    rec = [0.0, 0]
+                                    gt_acc[k] = rec
+                                gv = float(gt_row_vals[i]) if np.isfinite(gt_row_vals[i]) else None
+                                if gv is not None:
+                                    rec[0] += gv
+                                    rec[1] += 1
+
+                            gt_pairs = sorted({ (vid, dep) for (vid, dep, _d) in gt_acc.keys() })
+                            for vid, dep in gt_pairs:
+                                vname = None
+                                try:
+                                    id_to_var = getattr(self, "id_to_var", None) or getattr(getattr(self, "data", None), "id_to_var", None)
+                                    if id_to_var is not None:
+                                        vname = id_to_var.get(int(vid), None)
+                                        if vname is None:
+                                            vname = id_to_var.get(str(int(vid)), None)
+                                except Exception:
+                                    vname = None
+                                vkey = str(vname) if vname is not None else f"var_{int(vid)}"
+                                dkey = f"depth_{float(dep):.6f}"
+                                vrec = gt_variates_out.setdefault(vkey, {"mean": {}, "std": {}})
+                                mean_series = [None] * T
+                                std_series = [None] * T  # keep schema identical; GT has no std
+                                for d in dates:
+                                    rec = gt_acc.get((vid, dep, d))
+                                    if rec is None:
+                                        continue
+                                    if rec[1] > 0:
+                                        mean_series[date_to_j[d]] = float(rec[0] / float(rec[1]))
+                                vrec["mean"][dkey] = mean_series
+                                vrec["std"][dkey] = std_series
+
+                            gt_obj = {"dates": dates, "variates": gt_variates_out}
+                            sample_gt_fh.write(json.dumps({skey: gt_obj}, ensure_ascii=False) + "\n")
+                            sample_gt_written += 1
+                    except Exception as e:
+                        print(f"[export] Warning: failed to write per-sample predictions JSON: {e}")
+            
                 context_denorm = seq_X.detach()
                 var_ids_x_cpu = var_ids_x.detach()
                 mask_X_cpu = mask_X.detach()
@@ -1862,10 +2324,12 @@ class Evaluator:
                             scaler_DR=scalers.get("scaler_DR", None),
                             variate_ids_1D=scalers.get("variate_ids_1D", None),
                         )[0]
+                        # Keep masked tokens as 0.0 (they were NaN->0 upstream); this makes JSON easier to interpret.
                         context_denorm[b][mask_X_cpu[b] <= 0] = 0.0
                 
                 context_seq_list.append(context_denorm)
                 context_var_ids_list.append(var_ids_x_cpu)
+                # Store context depths in meters as well (for consistent plot/export).
                 depth_x_store = depth_values_x.detach()
                 try:
                     if lake_id_to_depth_minmax is not None:
@@ -1886,8 +2350,11 @@ class Evaluator:
             if self.rank==0:
                 pbar.update(1)
 
+            # collect per-lake preds & labels to compute lake-wise metrics
+            # flatten per-sample masked values and append into per-lake lists
             for i, lake_id in enumerate(lake_ids):
                 sel = mask_out[i].bool()
+                # Handle both dict and tensor predictions
                 if isinstance(pred, dict) and 'distribution' in pred:
                     pred_mean = pred['distribution'].mean
                 else:
@@ -1899,6 +2366,7 @@ class Evaluator:
                 lake_id_int = _to_int_lake_id(lake_id)
                 scalers = get_scalers_for_lake(lake_id_int)
                 
+                # Denormalize if flag is set (for lake-wise metrics)
                 if self.denorm_eval and scalers is not None:
                     pred_vals = Normalizer.denormalize_by_var_ids(
                         pred_vals, var_ids_sel,
@@ -1911,10 +2379,13 @@ class Evaluator:
                         variate_ids_2D=scalers["variate_ids_2D"]
                     )
                 
+                # Use int lake_id keys consistently across all lake-wise metrics / JSON outputs
                 lake_preds[int(lake_id_int)].append(pred_vals)
                 lake_labels[int(lake_id_int)].append(label_vals)
 
+            # build data map for collection (flattened data for irregular grids) - only if saving
             if self.save_preds:
+                # Store full prediction distribution if available
                 if isinstance(pred, dict) and 'distribution' in pred:
                     pred_np = {
                         'loc': pred['loc'].detach().cpu().numpy(),
@@ -1924,21 +2395,11 @@ class Evaluator:
                     }
                 else:
                     pred_np = pred.detach().cpu().numpy()
-
-                pred_grid_np = None
-                if pred_grid is not None:
-                    if isinstance(pred_grid, dict) and 'distribution' in pred_grid:
-                        pred_grid_np = {
-                            'loc': pred_grid['loc'].detach().cpu().numpy(),
-                            'scale': pred_grid['scale'].detach().cpu().numpy(),
-                            'df': pred_grid['df'].detach().cpu().numpy(),
-                            'mean': pred_grid['distribution'].mean.detach().cpu().numpy()
-                        }
-                    else:
-                        pred_grid_np = pred_grid.detach().cpu().numpy()
                 
+                # Handle datetime strings
                 datetime_arr = np.array(datetime_y, dtype='S')
                 
+                # Get sample indices from the batch
                 B = seq_Y.shape[0]
                 sample_indices = np.array(idx, dtype='int64') if isinstance(idx, (list, np.ndarray, torch.Tensor)) else np.arange(B, dtype='int64')
                 if isinstance(sample_indices, torch.Tensor):
@@ -1949,6 +2410,7 @@ class Evaluator:
                 labels_np = seq_Y.detach().cpu().numpy()
                 masks_np = mask_out.detach().cpu().numpy()
                 
+                # Compute per-sample MSE and MAE if requested
                 per_sample_mse = None
                 per_sample_mae = None
                 if self.save_per_sample_metrics:
@@ -1957,11 +2419,13 @@ class Evaluator:
                     for b in range(B):
                         valid_mask = masks_np[b].astype(bool)
                         if valid_mask.sum() > 0:
+                            # Get predictions (use mean if dict)
                             if isinstance(pred_np, dict):
                                 pred_mean_b = pred_np['mean'][b]
                             else:
                                 pred_mean_b = pred_np[b]
                             
+                            # Compute MSE and MAE only on valid predictions
                             pred_valid = pred_mean_b[valid_mask]
                             label_valid = labels_np[b][valid_mask]
                             
@@ -1987,20 +2451,11 @@ class Evaluator:
                     'datetime_strs': datetime_arr,
                     'sample_indices': sample_indices
                 }
-
-                if pred_grid_np is not None and has_tgt_grid:
-                    data_map["preds_grid"] = pred_grid_np
-                    data_map["tgt_var_ids_grid"] = sample["tgt_variate_ids"].detach().cpu().numpy()
-                    data_map["tgt_depth_vals_grid"] = sample["tgt_depth_values"].detach().cpu().numpy()
-                    data_map["tgt_time_vals_grid"] = sample["tgt_time_values"].detach().cpu().numpy()
-                    data_map["tgt_time_ids_grid"] = sample["tgt_time_ids"].detach().cpu().numpy()
-                    data_map["tgt_datetime_strs_grid"] = np.array(sample["tgt_datetime_strs"], dtype="datetime64[ns]")
-                    data_map["tgt_padding_mask_grid"] = sample["tgt_padding_mask"].detach().cpu().numpy()
-                
                 if per_sample_mse is not None:
                     data_map['per_sample_mse'] = per_sample_mse
                     data_map['per_sample_mae'] = per_sample_mae
                 
+                # Group data by lake_id for separate saving
                 B = seq_Y.shape[0]
                 for b in range(B):
                     lake_id_b = int(lake_ids[b])
@@ -2028,6 +2483,7 @@ class Evaluator:
                             sample_data_map[key] = val
                     collected_data_by_lake[lake_id_b].append(sample_data_map)
                 
+                # Also keep original format for backward compatibility (metrics computation)
                 collected_data.append(data_map)
 
                 
@@ -2036,6 +2492,7 @@ class Evaluator:
         
         # After collecting all data, pad and save to HDF5 - organized by lake
         if self.save_preds and collected_data_by_lake:
+            # Helper function to sanitize directory names
             def sanitize_dir_name(name):
                 """Sanitize a string to be filesystem-safe"""
                 import re
@@ -2047,12 +2504,14 @@ class Evaluator:
                     sanitized = sanitized[:200]
                 return sanitized
             
+            # Save predictions separately for each lake
             for lake_id, lake_data_list in collected_data_by_lake.items():
                 # Get lake name from collected mapping (already populated during batch loop)
                 lake_name = lake_id_to_name_all.get(lake_id, f"Lake_{lake_id}")
                 sanitized_lake_name = sanitize_dir_name(lake_name) or f"Lake_{lake_id}"
                 lake_dir_name = f"{sanitized_lake_name}"
                 
+                # Create lake-specific directory
                 lake_dir = os.path.join(save_dir, lake_dir_name)
                 os.makedirs(lake_dir, exist_ok=True)
                 
@@ -2062,6 +2521,7 @@ class Evaluator:
                 h5_file = h5py.File(h5_path, 'w')
                 save_preds_dict = {}
                 
+                # Find the maximum sequence length for this lake
                 max_seq_len = 0
                 for data_map in lake_data_list:
                     preds = data_map['preds']
@@ -2115,7 +2575,7 @@ class Evaluator:
                 # Pad other arrays
                 for name, arr in data_map.items():
                     if name == 'preds':
-                        continue 
+                        continue  # Already handled
                     
                     if isinstance(arr, np.ndarray) and len(arr.shape) > 1:
                         if arr.shape[1] < max_seq_len:
@@ -2196,18 +2656,49 @@ class Evaluator:
                             else:
                                 ds[old_size:old_size + arr.shape[0]] = arr
                 
+                # Close HDF5 file for this lake
                 h5_file.close()
                 if self.rank == 0:
                     print(f"Saved predictions for {lake_name} (ID: {lake_id}) to {h5_path}")
         
         if self.rank == 0 and collected_data_by_lake:
             print(f"Saved predictions for {len(collected_data_by_lake)} lake(s)")
+
+        # Finalize per-sample predictions JSON export
+        if self.rank == 0 and sample_pred_fh is not None:
+            try:
+                sample_pred_fh.close()
+            except Exception:
+                pass
+        if self.rank == 0 and sample_gt_fh is not None:
+            try:
+                sample_gt_fh.close()
+            except Exception:
+                pass
         
         # finalize global nll loss
         avg_batch_loss = batch_loss/len(dataloader)
         avg_batch_loss_tensor = torch.tensor(avg_batch_loss, device=self.device)
         avg_batch_loss_global = reduce_mean(avg_batch_loss_tensor, dist.get_world_size()).item()
 
+        # Aggregate inference profiling metrics across ranks.
+        infer_samples_t = torch.tensor(float(infer_samples), device=self.device)
+        infer_tokens_t = torch.tensor(float(infer_valid_tokens), device=self.device)
+        infer_time_t = torch.tensor(float(infer_step_time_s), device=self.device)
+        infer_peak_vram_t = torch.tensor(float(infer_forward_peak_vram_gb), device=self.device)
+        if dist.is_available() and dist.is_initialized():
+            dist.all_reduce(infer_samples_t, op=dist.ReduceOp.SUM)
+            dist.all_reduce(infer_tokens_t, op=dist.ReduceOp.SUM)
+            dist.all_reduce(infer_time_t, op=dist.ReduceOp.MAX)
+            dist.all_reduce(infer_peak_vram_t, op=dist.ReduceOp.MAX)
+        infer_total_samples = float(infer_samples_t.item())
+        infer_total_tokens = float(infer_tokens_t.item())
+        infer_time_max_s = max(float(infer_time_t.item()), 1e-8)
+        infer_throughput_samples_per_s = infer_total_samples / infer_time_max_s
+        infer_throughput_tokens_per_s = infer_total_tokens / infer_time_max_s
+        infer_peak_vram_gb = float(infer_peak_vram_t.item())
+
+        # compute per-lake masked MSE via F.mse_loss 
         mse_by_lake = {
             lake_id: F.mse_loss(
                     torch.cat(lake_preds[lake_id]),
@@ -2216,6 +2707,7 @@ class Evaluator:
             for lake_id in lake_preds
         }
         
+        # compute per-lake masked MAE via F.l1_loss
         mae_by_lake = {
             lake_id: F.l1_loss(
                     torch.cat(lake_preds[lake_id]),
@@ -2224,6 +2716,7 @@ class Evaluator:
             for lake_id in lake_preds
         }
         
+        # compute per-lake CRPS (aligned with variate-wise CRPS: Monte Carlo estimate over valid target tokens)
         if saw_distribution and len(lake_crps_counts) > 0:
             crps_by_lake = {}
             for lake_id in lake_preds:
@@ -2238,8 +2731,10 @@ class Evaluator:
             crps_by_lake = mae_by_lake.copy()
 
         if self.rank==0:
+            # Handle predictions (can be dict or tensor) - similar to val_one_epoch
             if len(preds_list_2d) > 0:
                 if isinstance(preds_list_2d[0], dict):
+                    # Use trainer's helper function for each prediction component
                     preds_list_2d = {
                         'loc': self.trainer._pad_and_concat_tensors([p['loc'] for p in preds_list_2d]),
                         'scale': self.trainer._pad_and_concat_tensors([p['scale'] for p in preds_list_2d]),
@@ -2258,8 +2753,21 @@ class Evaluator:
             depth_val_list = self.trainer._pad_and_concat_tensors(depth_val_list)
             time_val_list = self.trainer._pad_and_concat_tensors(time_val_list)
             
-            lake_names_list = np.array(lake_names_list).flatten()
-            lake_id_list = np.array(lake_id_list).flatten()
+            # Flatten/concatenate per-batch meta (loader returns tensor/array per batch; batches can differ in size when drop_last=False)
+            if len(lake_id_list) > 0:
+                if isinstance(lake_id_list[0], torch.Tensor):
+                    lake_id_list = torch.cat(lake_id_list, dim=0).cpu().numpy()
+                else:
+                    lake_id_list = np.concatenate([np.asarray(x).ravel() for x in lake_id_list])
+            else:
+                lake_id_list = np.array([])
+            if len(lake_names_list) > 0:
+                if isinstance(lake_names_list[0], np.ndarray):
+                    lake_names_list = np.concatenate(lake_names_list)
+                else:
+                    lake_names_list = np.concatenate([np.asarray(x).ravel() for x in lake_names_list])
+            else:
+                lake_names_list = np.array([])
         
        
         # Compute final metrics (lake-wise = overall metrics)
@@ -2331,6 +2839,7 @@ class Evaluator:
         mae_by_variate_by_lake = {}
         crps_by_variate_by_lake = {}
         
+        # All variates (no 2D/1D distinction for irregular grids)
         for var_id in var_mse_sums:
             if var_counts[var_id] > 0:
                 mse_by_variate[f"var_{var_id}"] = var_mse_sums[var_id] / var_counts[var_id]
@@ -2394,6 +2903,7 @@ class Evaluator:
                     inner_crps[var_key][depth_key] = float(crps_avg)
                     inner_cnt[var_key][depth_key] = cnt_int
 
+            # Drop empty leaves to keep JSON compact
             inner_mse = {vk: dv for vk, dv in inner_mse.items() if dv}
             inner_mae = {vk: dv for vk, dv in inner_mae.items() if dv}
             inner_crps = {vk: dv for vk, dv in inner_crps.items() if dv}
@@ -2413,9 +2923,11 @@ class Evaluator:
             if mse_by_variate:
                 print(f"Variate-wise metrics computed for {len(mse_by_variate)} variates")
 
+        # t+n x Date matrix
         tplusn_by_var = {}
         if max_horizon > 0 and len(tplusn_acc) > 0:
             tplusn_cols = [f"t+{i}" for i in range(1, int(max_horizon) + 1)]
+            # Optional: export per-date averages across horizons + plots
             export_tplusn_avg_csv = bool(getattr(self.cfg.evaluator, "export_tplusn_avg_csv", True))
             plot_tplusn_avg_predictions = bool(getattr(self.cfg.evaluator, "plot_tplusn_avg_predictions", True))
             for vid_int, by_date in tplusn_acc.items():
@@ -2454,6 +2966,8 @@ class Evaluator:
                     "max_horizon": int(max_horizon),
                 }
 
+                # Also export to CSV (one file per variate) under the current trial save_dir.
+                # Rows = dates, cols = t+1..t+max_horizon
                 if save_dir is not None:
                     out_dir = os.path.join(save_dir, "tplusn_matrices")
                     os.makedirs(out_dir, exist_ok=True)
@@ -2469,9 +2983,13 @@ class Evaluator:
                     df_pred_cnt.to_csv(os.path.join(out_dir, f"{var_key}_pred_cnt.csv"))
                     df_gt_cnt.to_csv(os.path.join(out_dir, f"{var_key}_gt_cnt.csv"))
 
+                    # Also export a per-date AVG prediction across all available horizons (T+1..T+N) + plot vs GT.
+                    # This matches the "avg across T+1..T+N" visualization request.
                     if export_tplusn_avg_csv or plot_tplusn_avg_predictions:
                         try:
+                            # AVG across horizons for each date (row-wise mean, ignoring NaNs)
                             pred_avg = df_pred.mean(axis=1, skipna=True)
+                            # GT is horizon-invariant (we fill gt_vec[:] per date), so take mean across horizons for robustness
                             gt_by_date = df_gt.mean(axis=1, skipna=True)
 
                             if export_tplusn_avg_csv:
@@ -2487,6 +3005,7 @@ class Evaluator:
                             if plot_tplusn_avg_predictions:
                                 plot_dir = os.path.join(save_dir, "tplusn_plots")
                                 os.makedirs(plot_dir, exist_ok=True)
+                                # Backward-compat: if the index is epoch seconds, parse with unit="s".
                                 idx_str = df_pred.index.astype(str)
                                 idx_num = pd.to_numeric(idx_str, errors="coerce")
                                 if np.isfinite(idx_num).all() and idx_num.size > 0 and float(np.nanmedian(idx_num)) > 1e8:
@@ -2526,6 +3045,8 @@ class Evaluator:
                             if self.rank == 0:
                                 print(f"[tplusn] Warning: failed to export/plot avg-across-horizons for {var_key}: {e}")
 
+        # --- T+N metrics (overall, by horizon) computed from the date×horizon matrices ---
+        # We compute these across *all variates* included in tplusn_acc.
         tplusn_metrics = {}
         tplusn_metrics_by_variate = {}
         if max_horizon > 0 and len(tplusn_acc) > 0:
@@ -2650,6 +3171,10 @@ class Evaluator:
             'n_obs': int(metric_count),
             'n_obs_definition': 'Number of valid target tokens (after masks) used to compute metrics.',
             'n_obs_by_lake': {int(lid): int(cnt) for lid, cnt in lake_token_counts.items()},
+            'infer_compute_time_s': infer_time_max_s,
+            'infer_peak_vram_gb': infer_peak_vram_gb,
+            'infer_throughput_samples_per_s': infer_throughput_samples_per_s,
+            'infer_throughput_tokens_per_s': infer_throughput_tokens_per_s,
         }
         
         # Variate-wise metrics (always)
@@ -2770,16 +3295,17 @@ class Evaluator:
 
         return ret
 
-    def plot_predictions(self, elements, flag, it, save_dir=None):
+    def plot_predictions(self, elements, flag, it, save_dir=None):    
         pretty_print(f"Prediction Visualization :: {flag}")
         preds=elements['preds2d']
         gt=elements['labels2d']
         var_ids=elements["var_ids_2d"]
-        depth_vals=elements['depth_vals']
+        depth_vals=elements['depth_vals'] # TODO: update depth vals to get raw/original depth values
         time_vals=elements['time_vals']
         datetime_raw_vals = elements['datetime_strs']
         gt_mask=elements['masks2d']
         
+        # Extract context (input X) data if available (for baseline comparison)
         context_seq = elements.get('context_seq', None)
         context_var_ids = elements.get('context_var_ids', None)
         context_depth_vals = elements.get('context_depth_vals', None)
@@ -2787,6 +3313,7 @@ class Evaluator:
         context_datetime_strs = elements.get('context_datetime_strs', None)
         context_mask = elements.get('context_mask', None)
 
+        # Best-effort lake name for plot titles
         lake_name_for_title = None
         if 'lake_names' in elements and elements['lake_names'] is not None and len(elements['lake_names']) > 0:
             lake_name_for_title = elements['lake_names'][0]
@@ -2796,6 +3323,7 @@ class Evaluator:
                 lake_name_for_title = lake_name_for_title.decode('utf-8')
             lake_name_for_title = str(lake_name_for_title)
         
+        # Handle total_samples for both dict and tensor predictions
         if isinstance(preds, dict):
             total_samples = preds['mean'].shape[0]
         else:
@@ -2803,6 +3331,8 @@ class Evaluator:
 
         id_to_var = self.data.id_to_var
 
+        # num_plot_batches controls how many windows we collected for plotting.
+        # If -1, we collected the full test stream, so treat "num_windows" as total_samples.
         num_windows = self.cfg.num_plot_batches
         try:
             if int(num_windows) < 0:
@@ -2811,11 +3341,13 @@ class Evaluator:
             pass
         num_samples = self.cfg.plot_num_samples
 
+        # Check if we have data to plot
         if preds is not None and gt is not None:
             start = 0
             idx = np.arange(start, start+total_samples, 1)
             plt_idx = np.floor(np.linspace(0, 1, 1))
             
+            # Set up plots directory for saving all plots
             if save_dir is not None:
                 eval_dir = save_dir
                 plots_dir = os.path.join(os.path.dirname(eval_dir), "PLOTS", os.path.basename(eval_dir))
@@ -2825,9 +3357,14 @@ class Evaluator:
             
             try:
                 
+                # breakpoint()
+                # Check if we should use heatmap plotting (regular grid forecasting)
+                # if self.regular_grid_forecasting and self.enable_heatmap_plotting:
+                    # Use heatmap plotting for regular grid data
                 print("\n\nPlotting regular grid heatmaps\n\n")
                 regular_grid_save_path = os.path.join(plots_dir, f"regular_grid_heatmaps_{flag}.png") if plots_dir is not None else None
                 if self.thermocline:
+                    # Water Temp only, 1x2 (GT vs Pred)
                     therm_save_path = os.path.join(plots_dir, f"thermocline_watertemp_heatmap_{flag}.png") if plots_dir is not None else regular_grid_save_path
                     wt_id = self._resolve_var_id(var_name=self.thermocline_var_name_substr, id_to_var=id_to_var)
                     self._plot_regular_grid_heatmaps(
@@ -2849,8 +3386,31 @@ class Evaluator:
                     if self.thermocline_skip_irregular_plots:
                         return
                     
+                # else:
                 print("\n\nPlotting irregular grid forecasts\n\n")
+                # Use irregular plotting for irregular grid data
                 irregular_grid_save_path = os.path.join(plots_dir, f"forecasts_{self.pred_len}_{lake_name_for_title}.pdf") if plots_dir is not None else None
+                # self.irregular_plotter.plot_forecast_irregular_grid(
+                #     gt_row=gt,
+                #     preds_row=preds,
+                #     time_vals_row=time_vals,
+                #     datetime_raw_vals=datetime_raw_vals,
+                #     depth_vals_row=depth_vals,
+                #     var_ids_row=var_ids,
+                #     mask_row=gt_mask,
+                #     feature_dict=id_to_var,
+                #     sample_idx=idx,
+                #     plt_idx=plt_idx,
+                #     epoch=it,
+                #     train_or_val=flag,
+                #     plot_type=self.cfg.forecast_plot_type,
+                #     max_features=14,
+                #     max_depths_per_feature=14,
+                #     filter_first_pred=True,
+                #     depth_units="norm",
+                #     plot_interval=self.cfg.plot_interval,
+                #     save_path=irregular_grid_save_path
+                # )
 
                 self.irregular_plotter.plot_forecast_irregular_grid_single_depth_var(
                     gt_row=gt,
@@ -2879,15 +3439,22 @@ class Evaluator:
                     depth_name=getattr(getattr(self.cfg, "plotter", None), "depth_name", 1.5),
                     pred_offset=getattr(getattr(self.cfg, "plotter", None), "pred_offset", 0.0),
                     plot_full_timeseries=bool(getattr(getattr(self.cfg, "plotter", None), "plot_full_timeseries", True)),
-                    show_xticks=bool(getattr(getattr(self.cfg, "plotter", None), "show_xticks", True)),
-                    show_xlabel=bool(getattr(getattr(self.cfg, "plotter", None), "show_xlabel", True)),
-                    ymin=getattr(getattr(self.cfg, "plotter", None), "ymin", None),
-                    ymax=getattr(getattr(self.cfg, "plotter", None), "ymax", None),
+                    year=getattr(getattr(self.cfg, "plotter", None), "year", None),
+                    plot_single_sample=bool(getattr(getattr(self.cfg, "plotter", None), "plot_single_sample", False)),
+                    select_single_sample_by_max_context=bool(getattr(getattr(self.cfg, "plotter", None), "select_single_sample_by_max_context", False)),
+                    select_single_sample_by_pred_variance=bool(getattr(getattr(self.cfg, "plotter", None), "select_single_sample_by_pred_variance", False)),
+                    # Always show axis labels/ticks for interpretability (override config defaults).
+                    show_xticks=True,
+                    show_xlabel=True,
+                    # Relax y-axis constraints: allow per-variable auto scaling.
+                    ymin=None,
+                    ymax=None,
                     axis_label_fontsize=int(getattr(getattr(self.cfg, "plotter", None), "axis_label_fontsize", 20)),
                     tick_labelsize=int(getattr(getattr(self.cfg, "plotter", None), "tick_labelsize", 20)),
-                    ytick_step=getattr(getattr(self.cfg, "plotter", None), "ytick_step", None),
+                    ytick_step=None,
                     show_title=bool(getattr(getattr(self.cfg, "plotter", None), "show_title", True)),
-                    show_ylabel=bool(getattr(getattr(self.cfg, "plotter", None), "show_ylabel", True)),
+                    show_ylabel=True,
+                    # Context (input X) data for baseline comparison
                     context_seq_row=context_seq,
                     context_var_ids_row=context_var_ids,
                     context_depth_vals_row=context_depth_vals,
@@ -2896,6 +3463,51 @@ class Evaluator:
                     context_mask_row=context_mask
                 )
 
+                # Optional: plot stitched T+n average (e.g., avg of T+2..T+14) for the same var/depth selection.
+                if bool(getattr(getattr(self.cfg, "plotter", None), "plot_tplusn_avg", False)):
+                    self.irregular_plotter.plot_forecast_irregular_grid_single_depth_var_tplusn_average(
+                        gt_row=gt,
+                        preds_row=preds,
+                        time_vals_row=time_vals,
+                        datetime_raw_vals=datetime_raw_vals,
+                        depth_vals_row=depth_vals,
+                        var_ids_row=var_ids,
+                        mask_row=gt_mask,
+                        feature_dict=id_to_var,
+                        sample_idx=idx,
+                        plt_idx=plt_idx,
+                        epoch=it,
+                        train_or_val=flag,
+                        title_prefix=getattr(getattr(self.cfg, "plotter", None), "tplusn_avg_title_prefix", "T+n Avg Forecast"),
+                        plot_type=self.cfg.forecast_plot_type,
+                        max_features=14,
+                        max_depths_per_feature=14,
+                        depth_units="m",
+                        var_names_subset=getattr(getattr(self.cfg, "plotter", None), "var_names_subset", ["WaterTemp_C"]),
+                        depth_index=getattr(getattr(self.cfg, "plotter", None), "depth_index", 1),
+                        pred_len=self.pred_len,
+                        lake_name=lake_name_for_title,
+                        save_path=irregular_grid_save_path,
+                        depth_name=getattr(getattr(self.cfg, "plotter", None), "depth_name", 1.5),
+                        pred_offset=getattr(getattr(self.cfg, "plotter", None), "pred_offset", 0.0),
+                        horizon_start=int(getattr(getattr(self.cfg, "plotter", None), "tplusn_avg_horizon_start", 1)),
+                        horizon_end=int(getattr(getattr(self.cfg, "plotter", None), "tplusn_avg_horizon_end", 14)),
+                        require_all_horizons=bool(getattr(getattr(self.cfg, "plotter", None), "tplusn_avg_require_all_horizons", False)),
+                        use_common_intersection=bool(getattr(getattr(self.cfg, "plotter", None), "tplusn_avg_use_common_intersection", False)),
+                        intersection_mode=str(getattr(getattr(self.cfg, "plotter", None), "tplusn_avg_intersection_mode", "range")),
+                        filename_prefix=str(getattr(getattr(self.cfg, "plotter", None), "tplusn_avg_filename_prefix", "tplusn_avg")),
+                        # Context (input X) data for baseline comparison (passed through for compatibility)
+                        context_seq_row=context_seq,
+                        context_var_ids_row=context_var_ids,
+                        context_depth_vals_row=context_depth_vals,
+                        context_time_vals_row=context_time_vals,
+                        context_datetime_strs=context_datetime_strs,
+                        context_mask_row=context_mask
+                    )
+
+                # Also save multi-horizon stitched forecasts (T+1/T+7/T+14/T+21) as a 2x2 figure.
+                # Uses the same base save_path but the plotter will prefix the filename with "t+N_preds_".
+                # Only plot if T+N metrics are enabled
                 if self.do_t_plus_n_metrics:
                     self.irregular_plotter.plot_forecast_irregular_grid_single_depth_var_multi_horizon(
                         gt_row=gt,
@@ -2913,6 +3525,7 @@ class Evaluator:
                         plot_type=self.cfg.forecast_plot_type,
                         max_features=14,
                         max_depths_per_feature=14,
+                        # IMPORTANT: keep all horizon points so we can stitch T+7/T+14/T+21 correctly
                         filter_first_pred=False,
                         depth_units="norm",
                         var_names_subset=getattr(getattr(self.cfg, "plotter", None), "var_names_subset", ["WaterTemp_C"]),
@@ -2927,6 +3540,7 @@ class Evaluator:
                         use_common_intersection=True,
                         intersection_mode="range",
                         filename_prefix="t+N_preds",
+                        # Context (input X) data for baseline comparison (accepted for compatibility)
                         context_seq_row=context_seq,
                         context_var_ids_row=context_var_ids,
                         context_depth_vals_row=context_depth_vals,
@@ -2934,6 +3548,149 @@ class Evaluator:
                         context_datetime_strs=context_datetime_strs,
                         context_mask_row=context_mask
                     )
+                
+                # Plot prediction error heatmaps (if enabled)
+            #     if self.enable_prediction_error_heatmaps:
+            #         print("\n\nPlotting prediction error heatmaps\n\n")
+            #         prediction_error_save_path = os.path.join(plots_dir, f"prediction_error_heatmaps_{flag}_epoch_{it}.png") if plots_dir is not None else None
+                    
+            #         # self.irregular_plotter.plot_prediction_error_heatmaps(
+            #         #     gt_row=gt,
+            #         #     preds_row=preds,
+            #         #     time_vals_row=time_vals,
+            #         #     datetime_raw_vals=datetime_raw_vals,
+            #         #     depth_vals_row=depth_vals,
+            #         #     var_ids_row=var_ids,
+            #         #     mask_row=gt_mask,
+            #         #     feature_dict=id_to_var,
+            #         #     sample_idx=idx,
+            #         #     epoch=it,
+            #         #     train_or_val=flag,
+            #         #     depth_min=self.depth_min,
+            #         #     depth_max=self.depth_max,
+            #         #     save_path=prediction_error_save_path,
+            #         #     pred_len=self.pred_len
+            #         # )
+            #         print("\n\nPlotting T+n prediction errors for date range\n\n")
+            #         # Get lake name if available - use the lake from the selected sample (most dense)
+            #         lake_name = None
+            #         if 'lake_names' in elements and 'lake_ids' in elements:
+            #             # Find sample with most observations (same logic as plot_Tn_predictions_for_day)
+            #             if isinstance(gt, dict):
+            #                 gt_for_count = gt['mean'] if 'mean' in gt else list(gt.values())[0]
+            #             else:
+            #                 gt_for_count = gt
+                        
+            #             if hasattr(gt_mask, 'detach'):
+            #                 mask_np = gt_mask.detach().cpu().numpy()
+            #             else:
+            #                 mask_np = np.asarray(gt_mask)
+                        
+            #             valid_mask = mask_np.astype(bool)
+            #             sample_observation_counts = [valid_mask[b].sum() for b in range(valid_mask.shape[0])]
+                        
+            #             if max(sample_observation_counts) > 0:
+            #                 selected_sample_idx = np.argmax(sample_observation_counts)
+            #                 # Get lake_id for the selected sample
+            #                 lake_ids = elements['lake_ids']
+            #                 if len(lake_ids) > selected_sample_idx:
+            #                     selected_lake_id = int(lake_ids[selected_sample_idx])
+            #                     # Try to get lake name from lake_id_to_name mapping first
+            #                     if 'lake_id_to_name' in elements and selected_lake_id in elements['lake_id_to_name']:
+            #                         lake_name = elements['lake_id_to_name'][selected_lake_id]
+            #                     # Fallback to lake_names array
+            #                     elif len(elements['lake_names']) > selected_sample_idx:
+            #                         lake_name = elements['lake_names'][selected_sample_idx]
+            #                         if isinstance(lake_name, bytes):
+            #                             lake_name = lake_name.decode('utf-8')
+            #         elif 'lake_names' in elements and len(elements['lake_names']) > 0:
+            #             # Fallback: Get the first lake name
+            #             lake_name = elements['lake_names'][0]
+            #             if isinstance(lake_name, bytes):
+            #                 lake_name = lake_name.decode('utf-8')
+                    
+            #         # Plot for each variable separately
+            #         for var_id, var_name in id_to_var.items():
+            #             tn_predictions_save_path = os.path.join(plots_dir, f"tn_predictions_{var_name}_{flag}_epoch_{it}.png") if plots_dir is not None else None
+            #             self.irregular_plotter.plot_Tn_predictions_for_day(
+            #                 preds_row=preds,
+            #                 gt_row=gt,
+            #                 datetime_raw_vals=datetime_raw_vals,
+            #                 depth_vals_row=depth_vals,
+            #                 var_ids_row=var_ids,
+            #                 mask_row=gt_mask,
+            #                 feature_dict=id_to_var,
+            #                 epoch=it,
+            #                 train_or_val=flag,
+            #                 var_name=var_name,
+            #                 lake_name=lake_name,
+            #                 start_date=None,  # Auto-select (prefers May-June)
+            #                 end_date=None,   # Auto-select (30 days after start)
+            #                 horizons=[1, 7, 14, 30],  # T+1, T+7, T+14, T+30
+            #                 max_depths=20,
+            #                 depth_min=self.depth_min,
+            #                 depth_max=self.depth_max,
+            #                 save_path=tn_predictions_save_path
+            #             )
+                    
+            #         # Plot single sample forecast for a specific depth
+            #         print("\n\nPlotting single sample forecast with context window\n\n")
+            #         # Find sample with most observations
+            #         if isinstance(gt, dict):
+            #             gt_for_count = gt['mean'] if 'mean' in gt else list(gt.values())[0]
+            #         else:
+            #             gt_for_count = gt
+                    
+            #         if hasattr(gt_for_count, 'detach'):
+            #             gt_np = gt_for_count.detach().cpu().numpy()
+            #         else:
+            #             gt_np = np.asarray(gt_for_count)
+                    
+            #         if hasattr(gt_mask, 'detach'):
+            #             mask_np = gt_mask.detach().cpu().numpy()
+            #         else:
+            #             mask_np = np.asarray(gt_mask)
+                    
+            #         valid_mask = mask_np.astype(bool)
+            #         sample_observation_counts = [valid_mask[b].sum() for b in range(valid_mask.shape[0])]
+            #         selected_sample_idx = np.argmax(sample_observation_counts)
+                    
+            #         # Get lake name for the selected sample
+            #         single_sample_lake_name = lake_name
+            #         if 'lake_ids' in elements and 'lake_id_to_name' in elements:
+            #             lake_ids = elements['lake_ids']
+            #             if len(lake_ids) > selected_sample_idx:
+            #                 selected_lake_id = int(lake_ids[selected_sample_idx])
+            #                 if selected_lake_id in elements['lake_id_to_name']:
+            #                     single_sample_lake_name = elements['lake_id_to_name'][selected_lake_id]
+                    
+            #         # Use a simple depth value
+            #         target_depth = 2.0
+                    
+            #         # Plot for first variable
+            #         first_var_name = list(id_to_var.values())[0]
+            #         single_sample_save_path = os.path.join(plots_dir, f"single_sample_forecast_{first_var_name}_depth_{target_depth:.1f}_{flag}_epoch_{it}.png") if plots_dir is not None else None
+            #         self.irregular_plotter.plot_single_sample_forecast(
+            #             inputs_row=gt,
+            #             gt_row=gt,
+            #             preds_row=preds,
+            #             time_vals_row=time_vals,
+            #             datetime_raw_vals=datetime_raw_vals,
+            #             depth_vals_row=depth_vals,
+            #             var_ids_row=var_ids,
+            #             mask_row=gt_mask,
+            #             feature_dict=id_to_var,
+            #             sample_idx=selected_sample_idx,
+            #             var_name=first_var_name,
+            #             target_depth=target_depth,
+            #             context_len=None,
+            #             horizons=[1, 7, 14, 30],
+            #             confidence_level=0.95,
+            #             epoch=it,
+            #             train_or_val=flag,
+            #             lake_name=single_sample_lake_name,
+            #             save_path=single_sample_save_path
+            #         )
             except Exception as e:
                 if self.rank == 0:
                     print(f"Skipping plot due to error: {e}")
@@ -2947,7 +3704,20 @@ class Evaluator:
                                    max_depths_per_var: int = 20):
         """
         Plot regular grid heatmaps for spatio-temporal forecasting
-
+        
+        Args:
+            gt: Ground truth data
+            preds: Predictions (can be dict with uncertainty or tensor)
+            time_vals: Time values
+            datetime_raw_vals: Datetime values
+            depth_vals: Depth values
+            var_ids: Variable IDs
+            gt_mask: Ground truth mask
+            id_to_var: Variable ID to name mapping
+            sample_idx: Sample indices
+            epoch: Current epoch
+            train_or_val: 'train' or 'val'
+            save_path: Optional path to save the figure
         """
         # Convert to numpy for plotting
         if hasattr(gt, 'cpu'):
@@ -2992,6 +3762,7 @@ class Evaluator:
             sample_idx_np = sample_idx
 
         
+        # Get dimensions from prediction shape (should be regular grid)
         if isinstance(preds_np, dict):
             pred_mean_np = preds_np['mean']
         else:
@@ -3035,6 +3806,7 @@ class Evaluator:
             gt_mat = np.full((Dn, B), np.nan)
             pred_mat = np.full((Dn, B), np.nan)
             
+            # Optional inverse scaling params per variable (removed - denormalization handled earlier if denorm_eval=True)
             mu, sigma = None, None
             
             for b in range(B):
@@ -3052,6 +3824,7 @@ class Evaluator:
                         earliest_idx = idxs[0]
                     gt_val = gt_np[b, earliest_idx]
                     pred_val = pred_mean_np[b, earliest_idx]
+                    # Inverse normalize if stats available
                     if mu is not None:
                         gt_val = gt_val * sigma + mu
                         pred_val = pred_val * sigma + mu
@@ -3160,6 +3933,10 @@ class Evaluator:
         trial_maes    = []
         trial_crpss   = []
         trial_wqls    = []
+        trial_infer_throughput_samples = []
+        trial_infer_throughput_tokens = []
+        trial_infer_peak_vram_gb = []
+        trial_infer_compute_time_s = []
         per_trial_lake_mse = []
         per_trial_lake_mae = []
         per_trial_lake_crps = []
@@ -3256,6 +4033,27 @@ class Evaluator:
                     }
                 except Exception:
                     pass
+        
+        # No global normalization loading here; denormalization uses per-lake scalers from dataset when enabled
+        # try:
+        #     ds0 = datasets[0] if isinstance(datasets, list) else datasets
+        # except Exception:
+        #     ds0 = None
+        
+        # if ds0 is not None and hasattr(ds0, 'norm') and hasattr(ds0, 'normalization_stats_path'):
+        #     try:
+        #         breakpoint()
+        #         self.var_norm_params = Normalizer.get_variable_normalization_params(
+        #             global_stats_path=ds0.normalization_stats_path)
+        #     except Exception as e:
+        #         if self.rank == 0:
+        #             print(f"Warning: failed to load normalization from dataset.norm: {e}")
+        
+        # if self.var_norm_params is None:
+        #     # from utils.util import Normalizer
+        #     # normalization_stats_path = f"{self.cfg.server_prefix}/lakefm/dev/norm_stats"
+        #     raise RuntimeError(f"Failed to load global normalization stats, and dataset.norm does not supply them. Expected stats at: {ds0.normalization_stats_path}")
+
         # prepare output directory if saving
         save_dir = None
         if self.cfg.evaluator.output_dir is None:
@@ -3318,6 +4116,18 @@ class Evaluator:
             trial_maes.append(eval_dict['mae'])
             trial_crpss.append(eval_dict['crps'])
             trial_wqls.append(eval_dict.get('wql', float('nan')))
+            trial_infer_throughput_samples.append(
+                float(eval_dict.get('infer_throughput_samples_per_s', float('nan')))
+            )
+            trial_infer_throughput_tokens.append(
+                float(eval_dict.get('infer_throughput_tokens_per_s', float('nan')))
+            )
+            trial_infer_peak_vram_gb.append(
+                float(eval_dict.get('infer_peak_vram_gb', float('nan')))
+            )
+            trial_infer_compute_time_s.append(
+                float(eval_dict.get('infer_compute_time_s', float('nan')))
+            )
             
             # build lake_id->name mapping from all trials and all batches
             # Priority: use mapping from test_once (all batches) if available, else fallback to plotting batches
@@ -3354,42 +4164,42 @@ class Evaluator:
                 lake_wql_trials[lake_id].append(v)
 
             # collect variate-wise metrics (always)
-                per_trial_variate_mse.append(eval_dict.get('mse_by_variate', {}))
-                per_trial_variate_mae.append(eval_dict.get('mae_by_variate', {}))
-                per_trial_variate_crps.append(eval_dict.get('crps_by_variate', {}))
-                per_trial_variate_wql.append(eval_dict.get('wql_by_variate', {}))
-                
-                for var_id, v in eval_dict.get('mse_by_variate', {}).items():
-                    variate_mse_trials[var_id].append(v)
-                for var_id, v in eval_dict.get('mae_by_variate', {}).items():
-                    variate_mae_trials[var_id].append(v)
-                for var_id, v in eval_dict.get('crps_by_variate', {}).items():
-                    variate_crps_trials[var_id].append(v)
-                for var_id, v in eval_dict.get('wql_by_variate', {}).items():
-                    variate_wql_trials[var_id].append(v)
+            per_trial_variate_mse.append(eval_dict.get('mse_by_variate', {}))
+            per_trial_variate_mae.append(eval_dict.get('mae_by_variate', {}))
+            per_trial_variate_crps.append(eval_dict.get('crps_by_variate', {}))
+            per_trial_variate_wql.append(eval_dict.get('wql_by_variate', {}))
+
+            for var_id, v in eval_dict.get('mse_by_variate', {}).items():
+                variate_mse_trials[var_id].append(v)
+            for var_id, v in eval_dict.get('mae_by_variate', {}).items():
+                variate_mae_trials[var_id].append(v)
+            for var_id, v in eval_dict.get('crps_by_variate', {}).items():
+                variate_crps_trials[var_id].append(v)
+            for var_id, v in eval_dict.get('wql_by_variate', {}).items():
+                variate_wql_trials[var_id].append(v)
 
             # collect per-lake per-variate metrics (always)
-                lb_mse = eval_dict.get('mse_by_variate_by_lake', {}) or {}
-                lb_mae = eval_dict.get('mae_by_variate_by_lake', {}) or {}
-                lb_crps = eval_dict.get('crps_by_variate_by_lake', {}) or {}
-                lb_wql = eval_dict.get('wql_by_variate_by_lake', {}) or {}
-                per_trial_lake_variate_mse.append(lb_mse)
-                per_trial_lake_variate_mae.append(lb_mae)
-                per_trial_lake_variate_crps.append(lb_crps)
-                per_trial_lake_variate_wql.append(lb_wql)
-                # aggregate across trials
-                for lake_id, d in lb_mse.items():
-                    for var_k, val in d.items():
-                        lake_var_mse_trials[int(lake_id)][var_k].append(val)
-                for lake_id, d in lb_mae.items():
-                    for var_k, val in d.items():
-                        lake_var_mae_trials[int(lake_id)][var_k].append(val)
-                for lake_id, d in lb_crps.items():
-                    for var_k, val in d.items():
-                        lake_var_crps_trials[int(lake_id)][var_k].append(val)
-                for lake_id, d in lb_wql.items():
-                    for var_k, val in d.items():
-                        lake_var_wql_trials[int(lake_id)][var_k].append(val)
+            lb_mse = eval_dict.get('mse_by_variate_by_lake', {}) or {}
+            lb_mae = eval_dict.get('mae_by_variate_by_lake', {}) or {}
+            lb_crps = eval_dict.get('crps_by_variate_by_lake', {}) or {}
+            lb_wql = eval_dict.get('wql_by_variate_by_lake', {}) or {}
+            per_trial_lake_variate_mse.append(lb_mse)
+            per_trial_lake_variate_mae.append(lb_mae)
+            per_trial_lake_variate_crps.append(lb_crps)
+            per_trial_lake_variate_wql.append(lb_wql)
+            # aggregate across trials
+            for lake_id, d in lb_mse.items():
+                for var_k, val in d.items():
+                    lake_var_mse_trials[int(lake_id)][var_k].append(val)
+            for lake_id, d in lb_mae.items():
+                for var_k, val in d.items():
+                    lake_var_mae_trials[int(lake_id)][var_k].append(val)
+            for lake_id, d in lb_crps.items():
+                for var_k, val in d.items():
+                    lake_var_crps_trials[int(lake_id)][var_k].append(val)
+            for lake_id, d in lb_wql.items():
+                for var_k, val in d.items():
+                    lake_var_wql_trials[int(lake_id)][var_k].append(val)
             # Store and print lake_to_variates mapping from first trial only (for debugging)
             if trial_idx == 0 and 'lake_to_variates' in eval_dict:
                 first_trial_lake_to_variates = eval_dict['lake_to_variates']
@@ -3432,6 +4242,14 @@ class Evaluator:
         std_crps = float(np.std(trial_crpss))
         mean_wql = float(np.nanmean(trial_wqls)) if trial_wqls else float('nan')
         std_wql = float(np.nanstd(trial_wqls)) if trial_wqls else float('nan')
+        mean_infer_thr_samples = float(np.nanmean(trial_infer_throughput_samples)) if trial_infer_throughput_samples else float('nan')
+        std_infer_thr_samples = float(np.nanstd(trial_infer_throughput_samples)) if trial_infer_throughput_samples else float('nan')
+        mean_infer_thr_tokens = float(np.nanmean(trial_infer_throughput_tokens)) if trial_infer_throughput_tokens else float('nan')
+        std_infer_thr_tokens = float(np.nanstd(trial_infer_throughput_tokens)) if trial_infer_throughput_tokens else float('nan')
+        mean_infer_peak_vram = float(np.nanmean(trial_infer_peak_vram_gb)) if trial_infer_peak_vram_gb else float('nan')
+        std_infer_peak_vram = float(np.nanstd(trial_infer_peak_vram_gb)) if trial_infer_peak_vram_gb else float('nan')
+        mean_infer_compute_time = float(np.nanmean(trial_infer_compute_time_s)) if trial_infer_compute_time_s else float('nan')
+        std_infer_compute_time = float(np.nanstd(trial_infer_compute_time_s)) if trial_infer_compute_time_s else float('nan')
         
         # per-lake mean/std for all metrics, and embed per-variable stats per lake
         lake_stats = {}
@@ -3498,14 +4316,45 @@ class Evaluator:
 
         # write JSON summary
         json_dict = {
+            "trial_mse": trial_mses,
+            "trial_mae": trial_maes,
+            "trial_crps": trial_crpss,
+            "trial_wql": trial_wqls,
+            "mean_mse":    mean_mse,
+            "std_mse":     std_mse,
+            "mean_mae":    mean_mae,
+            "std_mae":     std_mae,
+            "mean_crps":   mean_crps,
+            "std_crps":    std_crps,
+            "mean_wql":    mean_wql,
+            "std_wql":     std_wql,
+            "model_param_count_total": int(self.total_params),
+            "model_param_count_trainable": int(self.trainable_params),
+            "trial_infer_throughput_samples_per_s": trial_infer_throughput_samples,
+            "trial_infer_throughput_tokens_per_s": trial_infer_throughput_tokens,
+            "trial_infer_peak_vram_gb": trial_infer_peak_vram_gb,
+            "trial_infer_compute_time_s": trial_infer_compute_time_s,
+            "mean_infer_throughput_samples_per_s": mean_infer_thr_samples,
+            "std_infer_throughput_samples_per_s": std_infer_thr_samples,
+            "mean_infer_throughput_tokens_per_s": mean_infer_thr_tokens,
+            "std_infer_throughput_tokens_per_s": std_infer_thr_tokens,
+            "mean_infer_peak_vram_gb": mean_infer_peak_vram,
+            "std_infer_peak_vram_gb": std_infer_peak_vram,
+            "mean_infer_compute_time_s": mean_infer_compute_time,
+            "std_infer_compute_time_s": std_infer_compute_time,
+            "lake_stats":     lake_stats,
             "eval_dataset": self.cfg.evaluator.eval_dataset,
             "pretrain_dataset": list(self.data.pretrain_dataset),
             "model_epoch":  self.model_epoch,
         }
+        # NOTE: thermocline metrics are written to a dedicated JSON per-trial under trial_*/THERMOCLINE/.
+        # Token counts for weighted/unweighted aggregation
         if first_trial_n_obs_definition is not None:
             json_dict["n_obs_definition"] = first_trial_n_obs_definition
         if first_trial_n_obs is not None:
             json_dict["n_obs"] = first_trial_n_obs
+        if first_trial_n_obs_by_lake is not None:
+            json_dict["n_obs_by_lake"] = first_trial_n_obs_by_lake
         # WQL metadata
         if first_trial_wql_quantiles is not None:
             json_dict["wql_quantiles"] = first_trial_wql_quantiles
@@ -3515,6 +4364,35 @@ class Evaluator:
         json_dict["variate_stats"] = variate_stats
         if first_trial_n_obs_by_variate is not None:
             json_dict["n_obs_by_variate"] = first_trial_n_obs_by_variate
+        if first_trial_n_obs_by_variate_by_lake is not None:
+            json_dict["n_obs_by_variate_by_lake"] = first_trial_n_obs_by_variate_by_lake
+
+        # Depth-wise metrics payload (always)
+        if first_trial_depthwise is not None:
+            json_dict["depthwise_metrics"] = first_trial_depthwise
+        if first_trial_depthwise_n_obs is not None:
+            json_dict["depthwise_n_obs"] = first_trial_depthwise_n_obs
+        try:
+            if first_trial_depthwise_n_obs_by_depth is not None:
+                json_dict["depthwise_n_obs_by_depth"] = first_trial_depthwise_n_obs_by_depth
+        except Exception:
+            pass
+        json_dict["depth_bin_size_m"] = first_trial_depth_bin_size_m
+        json_dict["depth_round_decimals"] = first_trial_depth_round_decimals
+        if first_trial_depth_key_units is not None:
+            json_dict["depth_key_units"] = first_trial_depth_key_units
+        if first_trial_depth_minmax_by_lake is not None:
+            json_dict["depth_minmax_by_lake"] = first_trial_depth_minmax_by_lake
+        if first_trial_lake_id_to_name is not None:
+            json_dict["depthwise_lake_id_to_name"] = first_trial_lake_id_to_name
+        if first_trial_depthwise_variate_id_to_name is not None:
+            json_dict["depthwise_variate_id_to_name"] = first_trial_depthwise_variate_id_to_name
+        if first_trial_tplusn_metrics:
+            json_dict["tplusn_metrics"] = first_trial_tplusn_metrics
+
+        # Add lake_to_variates mapping from first trial to JSON
+        if first_trial_lake_to_variates is not None:
+            json_dict["lake_to_variates"] = first_trial_lake_to_variates
 
         json_path = os.path.join(save_dir, "evaluation_summary.json")
         with open(json_path, "w") as jf:
@@ -3524,6 +4402,7 @@ class Evaluator:
         
         # Save lake embedding trajectories if enabled
         if self.lake_embed_traj and 'lake_embed_traj' in eval_dict:
+            # Group embeddings by lake_id (keep lakes separate, don't concatenate)
             embeddings_np = eval_dict['lake_embed_traj'].cpu().numpy()  # (N, d_temporal)
             dates_np = np.array(eval_dict['lake_embed_traj_dates'])
             lake_ids_np = np.array(eval_dict['lake_embed_traj_lake_ids'])
@@ -3542,6 +4421,7 @@ class Evaluator:
                 save_dict[f'lake_{lake_id}_dates'] = dates_np[mask]  # (n_samples,)
                 save_dict[f'lake_{lake_id}_name'] = lake_name
             
+            # Save all lakes in one file, but separated by lake_id
             lake_embed_traj_path = os.path.join(save_dir, "lake_embedding_trajectories.npz")
             np.savez(lake_embed_traj_path, **save_dict)
             
@@ -3586,6 +4466,20 @@ class Evaluator:
         with h5py.File(summary_h5, 'w') as hf:
             for i in range(num_trials):
                 grp = hf.create_group(f"trial_{i}")
+                # this will store in a list form
+                # lake-wise MSE for this trial
+                # lake_dict = per_trial_lake_mse[i]
+                # lake_ids_i = np.array(list(lake_dict.keys()), dtype=np.int64)
+                # lake_vals_i = np.array(list(lake_dict.values()), dtype=np.float32)
+                # grp.create_dataset('mse_by_lake_ids', data=lake_ids_i)
+                # grp.create_dataset('mse_by_lake',     data=lake_vals_i)
+                # if self.do_variate_mse:
+                #     var_dict = per_trial_variate_mse[i]
+                #     var_ids_i = np.array(list(var_dict.keys()), dtype=np.int64)
+                #     var_vals_i = np.array(list(var_dict.values()), dtype=np.float32)
+                #     grp.create_dataset('mse_by_var_ids',   data=var_ids_i)
+                #     grp.create_dataset('mse_by_variate',   data=var_vals_i)
+                #                 # lake-wise: one dataset per lake for all metrics
                 lake_mse_dict = per_trial_lake_mse[i] or {}
                 lake_mae_dict = per_trial_lake_mae[i] or {}
                 lake_crps_dict = per_trial_lake_crps[i] or {}
@@ -3785,6 +4679,16 @@ class Evaluator:
                     "eval/crps_std": std_crps,
                     "eval/wql_mean": mean_wql,
                     "eval/wql_std": std_wql,
+                    "eval/model_param_count_total": int(self.total_params),
+                    "eval/model_param_count_trainable": int(self.trainable_params),
+                    "eval/infer_throughput_samples_per_s_mean": mean_infer_thr_samples,
+                    "eval/infer_throughput_samples_per_s_std": std_infer_thr_samples,
+                    "eval/infer_throughput_tokens_per_s_mean": mean_infer_thr_tokens,
+                    "eval/infer_throughput_tokens_per_s_std": std_infer_thr_tokens,
+                    "eval/infer_peak_vram_gb_mean": mean_infer_peak_vram,
+                    "eval/infer_peak_vram_gb_std": std_infer_peak_vram,
+                    "eval/infer_compute_time_s_mean": mean_infer_compute_time,
+                    "eval/infer_compute_time_s_std": std_infer_compute_time,
                 })
                 
                 # Lake-wise metrics
@@ -3824,6 +4728,16 @@ class Evaluator:
             "eval/crps_std":  std_crps,
             "eval/wql_mean": mean_wql,
             "eval/wql_std":  std_wql,
+            "eval/model_param_count_total": int(self.total_params),
+            "eval/model_param_count_trainable": int(self.trainable_params),
+            "eval/infer_throughput_samples_per_s_mean": mean_infer_thr_samples,
+            "eval/infer_throughput_samples_per_s_std": std_infer_thr_samples,
+            "eval/infer_throughput_tokens_per_s_mean": mean_infer_thr_tokens,
+            "eval/infer_throughput_tokens_per_s_std": std_infer_thr_tokens,
+            "eval/infer_peak_vram_gb_mean": mean_infer_peak_vram,
+            "eval/infer_peak_vram_gb_std": std_infer_peak_vram,
+            "eval/infer_compute_time_s_mean": mean_infer_compute_time,
+            "eval/infer_compute_time_s_std": std_infer_compute_time,
             "lake_stats":     lake_stats,
             "variate_stats": variate_stats
         }

@@ -10,7 +10,7 @@ from torch.utils.data import Sampler, SequentialSampler
 from collections import defaultdict
 
 PAD_VAL_ID=0
-PAD_VAL_DEFAULT=0
+PAD_VAL_DEFAULT=1e5
 
 class LakeBalancedBatchSampler(DistributedSampler):
     """
@@ -31,7 +31,15 @@ class LakeBalancedBatchSampler(DistributedSampler):
                         rank=rank, 
                         shuffle=True, 
                         seed=seed)
-
+        """
+        Args:
+            meta_df: pd.DataFrame with columns ['idx', 'lake_id']
+            P_pos: number of same-lake positives per anchor
+            batch_size: total number of samples per batch
+            num_replicas: number of distributed processes
+            rank: rank of current process
+            seed: random seed for shuffling
+        """
         if num_replicas is None:
             if not torch.distributed.is_available():
                 num_replicas = 1
@@ -79,6 +87,7 @@ class LakeBalancedBatchSampler(DistributedSampler):
         # Convert positive pools to numpy arrays for faster sampling
         self.positive_pools = {lake: np.array(indices) for lake, indices in self.by_lake.items()}
         
+        # Batch size components
         self.n_pos = P_pos
         self.n_neg = batch_size - P_pos - 1  # anchor + positives + negatives = batch_size
 
@@ -104,11 +113,14 @@ class LakeBalancedBatchSampler(DistributedSampler):
         num_full = (len(indices) + self.B - 1) // self.B  # ceil
         needed = num_full * self.B - len(indices)
         if needed > 0:
+            # repeat from start; safe because we only use indices as sample ids
             indices.extend(indices[:needed])
 
         # process full batch_size chunks
         for i in range(0, len(indices), self.batch_size):
             batch_indices = indices[i:i + self.batch_size]
+            # if len(batch_indices) < self.batch_size:
+            #     continue  # Skip incomplete batch
                 
             # Randomly select which samples will be anchors
             anchor_indices = np.random.choice(
@@ -144,14 +156,21 @@ class LakeBalancedBatchSampler(DistributedSampler):
             yield batch
 
     def __len__(self):
+        # Ceil division to reflect padding to full batches in __iter__
         return (self.num_samples + self.batch_size - 1) // self.batch_size
         
     def set_epoch(self, epoch):
+        """Sets the epoch for this sampler."""
         self.epoch = epoch
 
 def get_padding_mask(padded_tensor: 
                      torch.Tensor, 
                      pad_value: float = 0.0) -> torch.BoolTensor:
+    """
+    Updated padding mask function for irregular data.
+    Returns a mask of shape (B, T) where padded time-steps are marked as False.
+    Assumes padding is done with `PAD_VAL`.
+    """
     if padded_tensor.ndim == 3:  # (B, T, V)
         return ~(padded_tensor == pad_value).all(dim=-1)
     elif padded_tensor.ndim == 2:  # (B, T)
@@ -160,6 +179,16 @@ def get_padding_mask(padded_tensor:
         raise ValueError(f"Unsupported shape: {padded_tensor.shape}")
 
 def collate_fn(sample_dict):
+    """
+    Updated collate function to handle irregular lake data structure.
+    
+    Key changes:
+    1. Better handling of variable sequence lengths from irregular data
+    2. Improved padding strategy for (time, variable, depth, value) tokens
+    3. Maintains compatibility with existing pipeline
+    
+    `sample_dict` here is a `batch` of samples
+    """
     collated = {}
     keys = sample_dict[0].keys()
 
@@ -171,12 +200,10 @@ def collate_fn(sample_dict):
                 collated[key] = torch.stack(values)
             else:
                 collated[key] = None
-        # Keep metadata/non-tensor fields as lists (do not pad/stack)
-        elif key in [
-            # current names in dataset
-            "lake_id", "num2Dvars", "num1Dvars", "num_depths", "lake_name", "idx"
-        ]:
-            collated[key] = values
+        elif key in ["lake_id", "idx", "num2Dvars", "num1Dvars", "num_depths"]:
+            collated[key] = torch.tensor(values, dtype=torch.long)
+        elif key == "lake_name":
+            collated[key] = np.array(values)
         else:
             # convert numpy arrays to tensors when applicable
             if isinstance(values[0], np.ndarray):
@@ -227,6 +254,10 @@ def collate_fn(sample_dict):
     return collated
 
 def get_meta_df(datasets):
+    """
+    Updated metadata extraction for irregular datasets.
+    """
+    # Convert to list of datasets if needed
     if isinstance(datasets, ConcatDataset):
         ds_list = datasets.datasets
     elif isinstance(datasets, list):
@@ -255,6 +286,14 @@ def build_dataloader(
     use_cl=False,
     plot=False
 ):
+    """
+    Updated DataLoader builder for irregular lake data.
+    
+    Key improvements:
+    1. Uses irregular-aware collate function
+    2. Handles variable sequence lengths better
+    3. Maintains compatibility with existing training pipeline
+    """
     if isinstance(datasets, list):
         if len(datasets) == 1:
             dataset = datasets[0]

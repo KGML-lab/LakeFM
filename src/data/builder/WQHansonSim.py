@@ -4,7 +4,8 @@ import numpy as np
 
 from tqdm import tqdm
 from data.dataset import LakeDataset
-from data.eval_dataset import LakeEvalDataset
+# from data.eval_dataset import LakeEvalDataset
+from data.eval_dataset_regular import LakeEvalDataset
 from torch.utils.data import ConcatDataset
 from utils.exp_utils import pretty_print
 from data.builder.base import BaseLakeBuilder
@@ -33,6 +34,7 @@ class WQHansonSimBuilder():
         self.var2id = self.base.var2id_key
         self.id2var = self.base.id2var_key
         
+        # for ood sites, we need to override the normalization stats -> normalization is independently done for each context window
         if self.base.norm_override:
             self.norm_path = None
 

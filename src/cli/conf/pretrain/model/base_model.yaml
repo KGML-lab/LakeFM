@@ -4,31 +4,31 @@ model_name: lakefm
 
 # Encoder
 d_model: 128
-num_layers: 6
+num_layers: 12
 n_heads: 4
 
 # Variate, depth and input embedding dimension
 # d_model = var_embed_dim + depth_embed_dim + inp_embed_dim if using add_or_concat = "concat"
 # if using add_or_concat = "add", update only d_model, remaining three will be ignored
-var_embed_dim: 64
+var_embed_dim: 48
 depth_embed_dim: 32
-inp_embed_dim: 64
+inp_embed_dim: 96
 time_embed_dim: 16 # sin-cos
 
 # static and temporal dimension
-static_dim: 32
-temporal_dim: 96
+static_dim: 64
+temporal_dim: 128
 
 # Attention & Feedforward
 output_attention: false
 factor: 1
-dropout_p: 0.0
-head_dropout: 0.02
-d_ff: 2048
-attn_dropout_p: 0.0
+dropout_p: 0.1
+head_dropout: 0.05
+d_ff: 512
+attn_dropout_p: 0.05
 activation: swiglu
 
-revin: true
+revin: false
 
 tokenization: scalar # options: scalar, patch, temporal
 patch_size: 3
@@ -57,7 +57,7 @@ use_rope: True # if false, model, by default, switches to SPE
 
 # contrastive learning
 cl_proj_type: attention_pooling # mean_pooling
-cl_proj_dim: 64
+cl_proj_dim: 128
 
 # use time embed
 use_time_embed: True
@@ -65,17 +65,29 @@ use_time_embed: True
 # use pre-norm
 use_pre_norm: true
 
+# If false, do not split encoder output into static/temporal subspaces; use encoder output for both
+# forecasting and contrastive learning paths (decoder/heads then operate in d_model).
+task_projection: true
+
+# Forecast distribution type: student_t | normal | none
+# - student_t: loc + scale + df (Student-t NLL)
+# - normal:    loc + scale (Normal NLL)
+# - none:      point forecast only (MSE)
+distribution_type: student_t
+
 # Probabilistic forecasting: variate-wise degrees of freedom
 # If true: each variable gets a learnable base df + context-aware adjustment (hybrid approach)
 # If false: single learnable df per token (current default)
-variate_wise_df: false
+variate_wise_df: true
 
 # Degrees of freedom base source
 # If true: reuse var_id_embed with a linear projector (no gradient back to var_id_embed when stop_grad is true)
 # If false: use a separate variate_df_embedding
-shared_variate_embedding_for_df: false
+shared_variate_embedding_for_df: true
 # When using shared embedding, stop gradients into var_id_embed for df path
 stop_grad_on_shared_var_embed_for_df: true
 
 # Optional scheduling logic
 num_warmup_steps: 10000
+
+use_var_attn_bias: true

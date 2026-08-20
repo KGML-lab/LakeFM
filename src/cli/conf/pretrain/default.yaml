@@ -35,7 +35,7 @@ plot_interval: True
 
 # Regular grid forecasting options
 regular_grid_forecasting: False  # Enable regular grid forecasting for heatmap plotting
-regular_grid_depths: 12  # Number of depth levels for regular grid
+regular_grid_depths: null  # Use all available depths
 regular_grid_max_depth: null  # Max depth (auto-detect if null)
 enable_heatmap_plotting: True  # Enable heatmap plotting for regular grid data
 plot_both_heatmap_types: True  # Plot both regular and uncertainty heatmaps
@@ -55,7 +55,7 @@ run_name: lakefm_run_pt_v0
 project_name: lakefm
 server_prefix: raid
 
-PAD_VAL_DEFAULT: 0
+PAD_VAL_DEFAULT: 1e5
 PAD_VAL_ID: 0
 
 # masking params
@@ -207,3 +207,8 @@ plotter:
   ytick_step: null
   show_title: true
   show_ylabel: true
+  year: null
+  plot_single_sample: false
+  select_single_sample_by_max_context: false
+  select_single_sample_by_pred_variance: false
+  plot_tplusn_avg: false

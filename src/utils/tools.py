@@ -84,9 +84,13 @@ def transfer_weights(weights_path, model, exclude_head=True, device='cpu'):
                 unmatched_layers.append(name)
         else:
             unmatched_layers.append(name)
-            pass
+            pass # these are weights that weren't in the original model, such as a new head
     if matched_layers == 0:
         raise Exception("No shared weight names were found between the models")
     else:
+        # if len(unmatched_layers) > 0:
+        #     print(f'check unmatched_layers: {unmatched_layers}')
+        # else:
         print(f"weights from {weights_path} successfully transferred!\n")
+    # model = model.to(device)
     return model

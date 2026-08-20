@@ -3,7 +3,7 @@ set -euo pipefail
 
 eval_dataset="LakeBeD"
 node="${NPROC_PER_NODE:-1}"
-denorm_eval=False
+denorm_eval=True
 plot=False
 
 var_names_subset=null
@@ -114,7 +114,7 @@ fi
 SERVER_PREFIX="../resources"
 CKPT_FOLDER="lakefm/dev/pretrain_ckpts"
 EVAL_OUT_FOLDER="lakefm/dev/evaluations"
-ckpt_name="lakefm5m"
+ckpt_name="lakefm7m"
 CKPT_PATH="${SERVER_PREFIX}/${CKPT_FOLDER}/${ckpt_name}.pth"
 EVAL_OUTPUT_PATH="${SERVER_PREFIX}/${EVAL_OUT_FOLDER}/${ckpt_name}/${eval_dataset}"
 
@@ -129,21 +129,38 @@ cmd=(
   evaluator.ckpt_name="$ckpt_name"
   evaluator.num_trials=1
   evaluator.output_dir="$EVAL_OUTPUT_PATH"
-  dataloader.batch_size=32
+  dataloader.batch_size=4
   dataloader.shuffle=False
   data.use_global_lake_filter=true
   data.lake_ids="[\"${lake_name}\"]"
   data.lake_ids_format=list
   model.revin=False
+  model.d_model=128
+  model.num_layers=12
+  model.var_embed_dim=48
+  model.depth_embed_dim=32
+  model.inp_embed_dim=96
+  model.time_embed_dim=16
+  model.static_dim=64
+  model.temporal_dim=128
+  model.cl_proj_dim=128
+  model.d_ff=512
+  model.dropout_p=0.1
+  model.attn_dropout_p=0.05
+  model.head_dropout=0.05
+  model.variate_wise_df=true
+  model.shared_variate_embedding_for_df=true
+  model.task_projection=true
+  model.distribution_type=student_t
+  model.use_var_attn_bias=true
   data.ds_plot_id=0
+  data.norm_override=True
   dataloader.sharding_mode=ddp
+  dataloader.drop_last=False
   plot_merged=True
   plot_interval=True
   num_plot_batches=-1
   forecast_plot_type="line"
-  model.variate_wise_df=true
-  model.shared_variate_embedding_for_df=true
-  model.num_layers=12
   evaluator.denorm_eval="$denorm_eval"
   plotter.var_names_subset="$var_names_subset"
   mask_variable="$mask_variable"
@@ -151,7 +168,7 @@ cmd=(
   mask_var_across_depths="$mask_var_across_depths"
   mask_depth_across_variables="$mask_depth_across_variables"
   evaluator.plot="$plot"
-  dataloader.num_workers=12
+  dataloader.num_workers=8
 )
 
 if [[ -n "$depth_name" ]]; then

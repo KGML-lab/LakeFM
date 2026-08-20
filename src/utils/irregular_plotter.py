@@ -34,6 +34,19 @@ class IrregularGridPlotter:
                                       var_id, depth, lake_name, save_path):
         """
         Save corresponding context (input window) data for the selected predictions.
+        
+        Args:
+            data_points: List of prediction dicts, each with 'sample_idx', 'time', 'pred', 'gt'
+            context_seq_row: [batch, seq_len_x] Context values (DENORMALIZED)
+            context_var_ids_row: [batch, seq_len_x] Variable IDs
+            context_depth_vals_row: [batch, seq_len_x] Depth values
+            context_time_vals_row: [batch, seq_len_x] Time values
+            context_datetime_strs: [batch, seq_len_x] Raw datetime strings
+            context_mask_row: [batch, seq_len_x] Observed mask (0=masked, 1=observed)
+            var_id: Variable ID being plotted
+            depth: Depth being plotted
+            lake_name: Lake name for filename
+            save_path: Base path for saving (will create context subdirectory)
         """
         try:
             import os
@@ -120,6 +133,13 @@ class IrregularGridPlotter:
     def _compute_confidence_intervals(self, distribution, confidence_level=0.95):
         """
         Compute confidence intervals for Student-t distribution
+        
+        Args:
+            distribution: Student-t distribution object
+            confidence_level: Confidence level (e.g., 0.95 for 95% CI)
+        
+        Returns:
+            lower_bound, upper_bound: Confidence interval bounds
         """
         # For Student-t distribution, we can use the quantile function
         alpha = 1 - confidence_level
@@ -177,7 +197,10 @@ class IrregularGridPlotter:
         time_vals = time_vals[valid_idx]
         depth_vals = depth_vals[valid_idx]
         var_ids = var_ids[valid_idx]
+        # breakpoint()
+        # Optional: filter to first prediction time only
         if filter_first_pred:
+            # Use earliest time across tokens for this sample
             min_t = np.min(time_vals)
             sel_first = (time_vals == min_t)
             gt = gt[sel_first]
@@ -193,6 +216,7 @@ class IrregularGridPlotter:
                 unique_feats.append(int(vid))
             if len(unique_feats) >= max_features:
                 break
+        # breakpoint()
         nfeat = len(unique_feats)
         if nfeat == 0:
             return
@@ -283,6 +307,10 @@ class IrregularGridPlotter:
                           selected_times=None):
         """
         Plot depth profiles at selected time points
+        
+        Args:
+            selected_times: List of time indices to plot depth profiles for
+                           If None, plots at regular intervals
         """
         preds = preds.detach()
         gt = gt.detach()
@@ -378,6 +406,9 @@ class IrregularGridPlotter:
                                selected_depths=None):
         """
         Plot temporal evolution for selected depths as heatmaps
+        
+        Args:
+            selected_depths: List of depth values to plot. If None, uses all available depths
         """
         preds = preds.detach()
         gt = gt.detach()
@@ -490,7 +521,21 @@ class IrregularGridPlotter:
         
         For each (variable, depth) combination, extracts the first prediction from each sample
         to create a continuous time series of T+1 forecasts.
-    
+        
+        Args:
+            gt_row: Ground truth values (B, S) where B=num_samples, S=seq_len
+            preds_row: Predictions - can be dict with distribution params or tensor (B, S)
+            time_vals_row: Time values (B, S)
+            depth_vals_row: Depth values (B, S)
+            var_ids_row: Variable IDs (B, S)
+            mask_row: Valid token mask (B, S)
+            feature_dict: Mapping from variable ID to variable name
+            sample_idx: Sample indices
+            plt_idx: Indices of samples to plot
+            epoch: Current epoch
+            train_or_val: 'train' or 'val'
+            filter_first_pred: If True, only plot first prediction from each sample (T+1)
+            confidence_level: Confidence level for uncertainty bands (if distribution available)
         """
         # Handle predictions - extract mean if distribution dict
         if isinstance(preds_row, dict):
@@ -498,7 +543,7 @@ class IrregularGridPlotter:
             preds_mean = preds_row['mean'].detach().cpu().numpy()
             preds_loc = preds_row['loc'].detach().cpu().numpy()
             preds_scale = preds_row['scale'].detach().cpu().numpy()
-            preds_df = preds_row['df'].detach().cpu().numpy()
+            preds_df = preds_row['df'].detach().cpu().numpy() if ('df' in preds_row and preds_row['df'] is not None) else None
         else:
             has_distribution = False
             preds_mean = preds_row.detach().cpu().numpy() if hasattr(preds_row, 'detach') else np.asarray(preds_row)
@@ -512,8 +557,10 @@ class IrregularGridPlotter:
         
         num_samples = gt.shape[0]
         
+        # Collect T+1 predictions for each (variable, depth) combination
         # Key: (var_id, depth), Value: list of (time, pred_mean, gt, [lower, upper])
         var_depth_data = {}
+        # breakpoint()
         for sample_idx in range(num_samples):
             # Get valid tokens for this sample
             sample_mask = mask[sample_idx].astype(bool)
@@ -570,7 +617,11 @@ class IrregularGridPlotter:
                     
                     # Compute quantiles for confidence interval
                     alpha = 1 - confidence_level
-                    t_dist = stats.t(df=df_val, loc=loc, scale=scale)
+                    if df_val is None:
+                        # Normal approx if df is not available
+                        t_dist = stats.norm(loc=loc, scale=scale)
+                    else:
+                        t_dist = stats.t(df=df_val, loc=loc, scale=scale)
                     lower = t_dist.ppf(alpha / 2)
                     upper = t_dist.ppf(1 - alpha / 2)
                     
@@ -718,6 +769,10 @@ class IrregularGridPlotter:
                                                       depth_name=1.5,
                                                       pred_offset=0.0,
                                                       plot_full_timeseries=True,
+                                                      year: int | None = None,
+                                                      plot_single_sample: bool = False,
+                                                      select_single_sample_by_max_context: bool = False,
+                                                      select_single_sample_by_pred_variance: bool = False,
                                                       show_xticks: bool = True,
                                                       show_xlabel: bool = True,
                                                       ymin=None,
@@ -734,11 +789,37 @@ class IrregularGridPlotter:
                                                       context_time_vals_row=None,
                                                       context_datetime_strs=None,
                                                       context_mask_row=None):
-
+        """
+        Filtered variant of plot_forecast_irregular_grid():
+        - **var_names_subset**: list of variable names to plot (defaults to ["WaterTemp_C"])
+        - **depth_index**: pick exactly one depth per variable by index from the sorted unique depths list
+        - **pred_len**: optional, used for the title; also used to truncate the plotted series unless `plot_full_timeseries=True`
+        - **plot_full_timeseries**: if True, do NOT truncate to pred_len; plot the full stitched time-series
+        - **year**: if not None, filter plotted points to this calendar year (UTC-based)
+        - **plot_single_sample**: if True, do NOT stitch across forecast windows; plot only the first window (sidx=0)
+        - **select_single_sample_by_max_context**: if True and `plot_single_sample=True`, choose the single plotted sample
+          as the one with the highest number of non-padding context tokens (based on `context_datetime_strs`)
+        - **select_single_sample_by_pred_variance**: if True and `plot_single_sample=True`, choose the single plotted sample
+          as the one with the highest prediction variation (measured as max peak-to-peak range over the plotted var(s) at the
+          plotted depth selection within that sample). Useful when many single-sample plots are flat lines.
+       
+        
+        This avoids depth matching logic entirely and keeps the original function unchanged
+        """
+        # Styling (explicit colors + markers)
         pred_color = "tab:orange"
         gt_color = "tab:blue"
-        pred_marker = "o"
+        # Predictions: line only (no markers) for clarity on dense daily grids.
+        pred_marker = None
         gt_marker = "o"
+
+        # In single-sample mode we want a contiguous "within-window" curve (e.g., ~pred_len days),
+        # not the stitched T+1 behavior. So we disable the "keep earliest per (var, depth)" logic
+        # and (by default) avoid plotting a longer stitched series than pred_len.
+        effective_filter_first_pred = bool(filter_first_pred) and (not bool(plot_single_sample))
+        effective_plot_full_timeseries = bool(plot_full_timeseries) and (not bool(plot_single_sample))
+
+        printed_context_overview = False
 
         # Handle predictions - extract mean if distribution dict
         if isinstance(preds_row, dict):
@@ -746,7 +827,7 @@ class IrregularGridPlotter:
             preds_mean = preds_row['mean'].detach().cpu().numpy()
             preds_loc = preds_row['loc'].detach().cpu().numpy()
             preds_scale = preds_row['scale'].detach().cpu().numpy()
-            preds_df = preds_row['df'].detach().cpu().numpy()
+            preds_df = preds_row['df'].detach().cpu().numpy() if ('df' in preds_row and preds_row['df'] is not None) else None
         else:
             has_distribution = False
             preds_mean = preds_row.detach().cpu().numpy() if hasattr(preds_row, 'detach') else np.asarray(preds_row)
@@ -758,26 +839,275 @@ class IrregularGridPlotter:
         mask = mask_row.detach().cpu().numpy() if hasattr(mask_row, 'detach') else np.asarray(mask_row)
         
         num_samples = gt.shape[0]
+
+        def _count_nonpad_tokens_from_datetimes(dt_arr) -> int:
+            """
+            Count non-padding tokens in a 1D datetime-like array. Padding is typically NaT or empty/NaT-like strings.
+            Mirrors the non-padding logic used for Y tokens in this function.
+            """
+            a = np.asarray(dt_arr)
+            if a.size == 0:
+                return 0
+            idx = None
+            try:
+                if np.issubdtype(a.dtype, np.datetime64):
+                    idx = np.where(~np.isnat(a))[0]
+            except Exception:
+                idx = None
+            if idx is None:
+                try:
+                    as_str = np.array(
+                        [
+                            (t.decode("utf-8") if isinstance(t, (bytes, bytearray)) else str(t))
+                            for t in a
+                        ],
+                        dtype=object
+                    )
+                    bad = (as_str == "") | (as_str == "NaT") | (as_str == "None") | (as_str == "nan")
+                    idx = np.where(~bad)[0]
+                except Exception:
+                    idx = np.arange(a.shape[0], dtype=int)
+            return int(idx.size)
+
+        # In single-sample mode, optionally choose the sample with the highest number of context tokens.
+        selected_sidx = 0
+        if bool(plot_single_sample) and bool(select_single_sample_by_pred_variance) and num_samples > 0:
+            # Prefer selecting by prediction variation (non-flat) if requested.
+            # If both selectors are enabled, prediction-variance wins (more directly aligned with plot appearance).
+            if bool(select_single_sample_by_max_context):
+                print("[single-sample] Note: both select_single_sample_by_pred_variance and select_single_sample_by_max_context are True; using pred-variance selection")
+
+            # Determine which var(s) this plot will include (default matches later behavior).
+            vnames_for_score = var_names_subset if var_names_subset is not None else ["WaterTemp_C"]
+            name_to_id = {vname: int(vid) for vid, vname in feature_dict.items()}
+            score_var_ids = [name_to_id[n] for n in vnames_for_score if n in name_to_id]
+
+            best_sidx = 0
+            best_score = -1.0
+            for s in range(int(num_samples)):
+                try:
+                    times_all_s = np.asarray(datetime_raw_vals[s])
+                    token_idx_s = None
+                    try:
+                        if np.issubdtype(times_all_s.dtype, np.datetime64):
+                            token_idx_s = np.where(~np.isnat(times_all_s))[0]
+                    except Exception:
+                        token_idx_s = None
+                    if token_idx_s is None:
+                        try:
+                            as_str = np.array(
+                                [
+                                    (t.decode("utf-8") if isinstance(t, (bytes, bytearray)) else str(t))
+                                    for t in times_all_s
+                                ],
+                                dtype=object
+                            )
+                            bad = (as_str == "") | (as_str == "NaT") | (as_str == "None") | (as_str == "nan")
+                            token_idx_s = np.where(~bad)[0]
+                        except Exception:
+                            token_idx_s = np.arange(times_all_s.shape[0], dtype=int)
+                    if token_idx_s.size == 0:
+                        continue
+
+                    p = preds_mean[s, token_idx_s]
+                    v = var_ids[s, token_idx_s]
+                    d = depth_vals[s, token_idx_s]
+
+                    # If we couldn't map names -> ids, fall back to "any var" scoring.
+                    vars_to_consider = score_var_ids if len(score_var_ids) > 0 else sorted(set(v.astype(int).tolist()))
+                    score_s = 0.0
+                    for vid in vars_to_consider:
+                        vid_mask = (v.astype(int) == int(vid))
+                        if not np.any(vid_mask):
+                            continue
+                        depths_for_var = np.unique(d[vid_mask].astype(float))
+                        if depths_for_var.size == 0:
+                            continue
+                        depths_for_var = np.sort(depths_for_var)
+
+                        # Choose the depth that this plot would choose for this variable within this sample.
+                        du = (str(depth_units).lower() if depth_units is not None else "")
+                        chosen_depth = float(depths_for_var[0])
+                        if du in ("m", "meter", "meters"):
+                            try:
+                                req_m = float(depth_name)
+                                chosen_depth = float(min(depths_for_var, key=lambda x: abs(float(x) - req_m)))
+                            except Exception:
+                                chosen_depth = float(depths_for_var[0])
+                        else:
+                            try:
+                                di = int(depth_index)
+                            except Exception:
+                                di = 0
+                            if di < 0:
+                                di = 0
+                            if di >= len(depths_for_var):
+                                di = len(depths_for_var) - 1
+                            chosen_depth = float(depths_for_var[di])
+
+                        depth_mask = np.isclose(d.astype(float), chosen_depth, atol=1e-6)
+                        use = vid_mask & depth_mask
+                        if not np.any(use):
+                            continue
+                        pv = p[use]
+                        # Peak-to-peak is a simple "flatness" score; higher means less flat.
+                        try:
+                            ptp = float(np.nanmax(pv) - np.nanmin(pv))
+                        except Exception:
+                            ptp = 0.0
+                        if ptp > score_s:
+                            score_s = ptp
+
+                    if score_s > best_score:
+                        best_score = float(score_s)
+                        best_sidx = int(s)
+                except Exception:
+                    continue
+
+            selected_sidx = int(best_sidx)
+            print(f"[single-sample] selected sidx={selected_sidx} (max pred ptp={best_score:.6g}) out of {int(num_samples)} sample(s)")
+
+        elif bool(plot_single_sample) and bool(select_single_sample_by_max_context) and num_samples > 0:
+            if context_datetime_strs is None:
+                print("[single-sample] Warning: select_single_sample_by_max_context=True but context_datetime_strs is None; defaulting to sidx=0")
+            else:
+                try:
+                    ctx_n = int(min(num_samples, len(context_datetime_strs)))
+                except Exception:
+                    ctx_n = int(num_samples)
+                best_sidx = 0
+                best_cnt = -1
+                for s in range(ctx_n):
+                    try:
+                        cnt = _count_nonpad_tokens_from_datetimes(context_datetime_strs[s])
+                    except Exception:
+                        cnt = 0
+                    if cnt > best_cnt:
+                        best_cnt = cnt
+                        best_sidx = int(s)
+                selected_sidx = int(best_sidx)
+                print(f"[single-sample] selected sidx={selected_sidx} (max context tokens={int(best_cnt)}) out of {int(ctx_n)} sample(s)")
         
+        # Collect T+1 predictions for each (variable, depth) combination
         var_depth_data = {}
-        for sidx in range(num_samples):
-            sample_mask = mask[sidx].astype(bool)
-            valid_idx = np.where(sample_mask)[0]
-            if valid_idx.size == 0:
+        sidx_iter = [selected_sidx] if (bool(plot_single_sample) and num_samples > 0) else range(num_samples)
+        for sidx in sidx_iter:
+            # IMPORTANT (regular daily-grid Y):
+            # - `mask_row`/`mask` indicates where GT is observed (1) vs missing (0)
+            # - but model predictions exist for *all* query tokens on the dense grid
+            # So: select tokens by "non-padding" (valid datetime), and use `mask` only to decide
+            # which GT points to plot as markers.
+            obs_mask = mask[sidx].astype(bool)
+
+            # Prefer datetime-based non-padding detection (padding typically uses NaT).
+            times_all = np.asarray(datetime_raw_vals[sidx])
+            if times_all.size == 0:
                 continue
-            
-            sample_gt = gt[sidx, valid_idx]
-            sample_preds = preds_mean[sidx, valid_idx]
-            sample_times = datetime_raw_vals[sidx, valid_idx]
-            sample_depths = depth_vals[sidx, valid_idx]
-            sample_vars = var_ids[sidx, valid_idx]
+
+            token_idx = None
+            try:
+                if np.issubdtype(times_all.dtype, np.datetime64):
+                    token_idx = np.where(~np.isnat(times_all))[0]
+            except Exception:
+                token_idx = None
+
+            if token_idx is None:
+                # Fallback for object/bytes datetimes: treat empty/NaT-like strings as padding.
+                try:
+                    as_str = np.array(
+                        [
+                            (t.decode("utf-8") if isinstance(t, (bytes, bytearray)) else str(t))
+                            for t in times_all
+                        ],
+                        dtype=object
+                    )
+                    bad = (as_str == "") | (as_str == "NaT") | (as_str == "None") | (as_str == "nan")
+                    token_idx = np.where(~bad)[0]
+                except Exception:
+                    token_idx = np.arange(times_all.shape[0], dtype=int)
+
+            if token_idx.size == 0:
+                continue
+
+            sample_gt = gt[sidx, token_idx]
+            sample_preds = preds_mean[sidx, token_idx]
+            sample_times = times_all[token_idx]
+            sample_depths = depth_vals[sidx, token_idx]
+            sample_vars = var_ids[sidx, token_idx]
+            sample_obs = obs_mask[token_idx]
+
+            # Single-sample mode: print context token counts once (for the sample being plotted).
+            if (bool(plot_single_sample)
+                and (not printed_context_overview)
+                and context_datetime_strs is not None):
+                try:
+                    ctx_datetimes = np.asarray(context_datetime_strs[sidx])
+                    ctx_var_ids = None
+                    ctx_depths = None
+                    if context_var_ids_row is not None:
+                        ctx_var_ids = (context_var_ids_row[sidx].detach().cpu().numpy()
+                                       if hasattr(context_var_ids_row[sidx], "detach")
+                                       else np.asarray(context_var_ids_row[sidx]))
+                    if context_depth_vals_row is not None:
+                        ctx_depths = (context_depth_vals_row[sidx].detach().cpu().numpy()
+                                      if hasattr(context_depth_vals_row[sidx], "detach")
+                                      else np.asarray(context_depth_vals_row[sidx]))
+
+                    # Determine non-padding tokens using datetimes (mirrors Y-token logic above).
+                    valid_ctx_idx = None
+                    try:
+                        if np.issubdtype(ctx_datetimes.dtype, np.datetime64):
+                            valid_ctx_idx = np.where(~np.isnat(ctx_datetimes))[0]
+                    except Exception:
+                        valid_ctx_idx = None
+                    if valid_ctx_idx is None:
+                        try:
+                            as_str = np.array(
+                                [
+                                    (t.decode("utf-8") if isinstance(t, (bytes, bytearray)) else str(t))
+                                    for t in ctx_datetimes
+                                ],
+                                dtype=object
+                            )
+                            bad = (as_str == "") | (as_str == "NaT") | (as_str == "None") | (as_str == "nan")
+                            valid_ctx_idx = np.where(~bad)[0]
+                        except Exception:
+                            valid_ctx_idx = np.arange(ctx_datetimes.shape[0], dtype=int)
+
+                    ctx_total = int(valid_ctx_idx.size)
+                    print(f"[single-sample] context tokens (non-pad)={ctx_total}")
+
+                    # Also print counts per (var_id, depth) for this sample's context window (non-pad tokens only).
+                    if ctx_var_ids is not None and ctx_depths is not None and ctx_total > 0:
+                        # Defensive truncation to a common length
+                        min_len = int(min(len(ctx_var_ids), len(ctx_depths), len(ctx_datetimes)))
+                        if min_len > 0:
+                            vv = np.asarray(ctx_var_ids[:min_len])[valid_ctx_idx[valid_ctx_idx < min_len]]
+                            dd = np.asarray(ctx_depths[:min_len])[valid_ctx_idx[valid_ctx_idx < min_len]]
+                            counts = {}
+                            for vid, dep in zip(vv.astype(int).tolist(), dd.astype(float).tolist()):
+                                # Round depth for stable printing (depths are continuous floats)
+                                k = (int(vid), float(np.round(dep, 6)))
+                                counts[k] = counts.get(k, 0) + 1
+                            if len(counts) > 0:
+                                print("[single-sample] context tokens by (var_id, depth):")
+                                for (vid, dep), c in sorted(counts.items(), key=lambda x: (x[0][0], x[0][1])):
+                                    vname = feature_dict.get(int(vid), f"Var_{int(vid)}")
+                                    print(f"  - {vname} (id={int(vid)}), depth={float(dep):.6f}: {int(c)}")
+                except Exception as e:
+                    print(f"[single-sample] Warning: failed to compute context token count: {e}")
+
+                printed_context_overview = True
             
             if has_distribution:
-                sample_loc = preds_loc[sidx, valid_idx]
-                sample_scale = preds_scale[sidx, valid_idx]
-                sample_df = preds_df[sidx, valid_idx]
+                sample_loc = preds_loc[sidx, token_idx]
+                sample_scale = preds_scale[sidx, token_idx]
+                sample_df = preds_df[sidx, token_idx]
 
-            if filter_first_pred and len(sample_times) > 0:
+            # If filter_first_pred: keep the earliest token per (var, depth) within this sample.
+            # This produces a consistent stitched T+1 time-series across the full evaluation stream.
+            if effective_filter_first_pred and len(sample_times) > 0:
+                # Decode bytes -> str for datetime parsing
                 if isinstance(sample_times[0], bytes):
                     times_str = np.array([t.decode("utf-8") for t in sample_times], dtype=object)
                 else:
@@ -800,6 +1130,7 @@ class IrregularGridPlotter:
                 sample_times = sample_times[keep_idx]
                 sample_depths = sample_depths[keep_idx]
                 sample_vars = sample_vars[keep_idx]
+                sample_obs = sample_obs[keep_idx]
 
                 if has_distribution:
                     sample_loc = sample_loc[keep_idx]
@@ -821,14 +1152,18 @@ class IrregularGridPlotter:
                     df_val = sample_df[i]
                     
                     alpha = 1 - confidence_level
-                    t_dist = stats.t(df=df_val, loc=loc, scale=scale)
-                    lower = t_dist.ppf(alpha / 2)
-                    upper = t_dist.ppf(1 - alpha / 2)
+                    if df_val is None:
+                        t_dist = stats.norm(loc=loc, scale=scale)
+                    else:
+                        t_dist = stats.t(df=df_val, loc=loc, scale=scale)
+                        lower = t_dist.ppf(alpha / 2)
+                        upper = t_dist.ppf(1 - alpha / 2)
                     
                     var_depth_data[key].append({
                         'time': sample_times[i],
                         'pred': sample_preds[i],
                         'gt': sample_gt[i],
+                        'obs': bool(sample_obs[i]),
                         'lower': lower,
                         'upper': upper,
                         'sample_idx': sidx  # Track which sample this prediction came from
@@ -838,6 +1173,7 @@ class IrregularGridPlotter:
                         'time': sample_times[i],
                         'pred': sample_preds[i],
                         'gt': sample_gt[i],
+                        'obs': bool(sample_obs[i]),
                         'sample_idx': sidx  # Track which sample this prediction came from
                     })
         
@@ -858,7 +1194,8 @@ class IrregularGridPlotter:
             print("No valid data to plot")
             return
         
-        fig, axes = plt.subplots(len(unique_vars), 1, figsize=(10, 4 * len(unique_vars)))
+        # Larger canvas for dense daily grids + multiple variables
+        fig, axes = plt.subplots(len(unique_vars), 1, figsize=(18, 6 * len(unique_vars)))
         if len(unique_vars) == 1:
             axes = [axes]
 
@@ -868,6 +1205,10 @@ class IrregularGridPlotter:
             depths_for_var = sorted(set([k[1] for k in var_depth_data.keys() if k[0] == var_id]))
             if len(depths_for_var) == 0:
                 continue
+            # Depth selection:
+            # - If depth_units indicates meters, interpret `depth_name` as the requested depth in meters
+            #   and select the closest available depth.
+            # - Otherwise (legacy), select by index into sorted unique depths.
             requested_depth_m = None
             du = (str(depth_units).lower() if depth_units is not None else "")
             if du in ("m", "meter", "meters"):
@@ -890,6 +1231,7 @@ class IrregularGridPlotter:
             if depth_for_title is None and len(depths_for_var) > 0:
                 depth_for_title = float(depths_for_var[0])
             
+            # Only one depth is selected; still keep the loop structure
             for depth in depths_for_var:
                 key = (var_id, depth)
                 if key not in var_depth_data:
@@ -899,14 +1241,21 @@ class IrregularGridPlotter:
                 times = np.array([d['time'] for d in data_points])
                 preds = np.array([d['pred'] for d in data_points])
                 gts = np.array([d['gt'] for d in data_points])
+                obs = np.array([bool(d.get('obs', True)) for d in data_points], dtype=bool)
+                # Post-processing:
+                # - sort by time
+                # - take unique value per time-step (one per calendar day)
+                # - then slice first pred_len points
                 times_dt = pd.to_datetime(times, utc=True)
                 order = np.argsort(times_dt.astype("int64"))
                 times_dt = times_dt[order]
                 preds = preds[order]
                 gts = gts[order]
+                obs = obs[order]
                 data_points = [data_points[i] for i in order.tolist()]
 
                 # Deduplicate by day (keep first occurrence per day)
+                # times_dt is often timezone-aware (UTC); convert to naive UTC before numpy ops.
                 dti = pd.DatetimeIndex(times_dt)
                 if dti.tz is not None:
                     dti = dti.tz_convert("UTC").tz_localize(None)
@@ -916,9 +1265,11 @@ class IrregularGridPlotter:
                 times_dt = times_dt[first_idx]
                 preds = preds[first_idx]
                 gts = gts[first_idx]
+                obs = obs[first_idx]
                 data_points = [data_points[i] for i in first_idx.tolist()]
 
-                if not plot_full_timeseries:
+                # Optionally truncate to pred_len points for a compact view.
+                if not effective_plot_full_timeseries:
                     try:
                         pl = int(pred_len)
                     except Exception:
@@ -928,7 +1279,30 @@ class IrregularGridPlotter:
                         preds = preds[:pl]
                         gts = gts[:pl]
                         data_points = data_points[:pl]
+                        obs = obs[:pl]
+
+                # Optional year filter (after sorting/deduping/truncation)
+                if year is not None and len(times_dt) > 0:
+                    try:
+                        y = int(year)
+                        yrs = pd.DatetimeIndex(times_dt).year.to_numpy(dtype=int)
+                        keep_y = (yrs == y)
+                        keep_y = np.asarray(keep_y, dtype=bool)
+                        times_dt = times_dt[keep_y]
+                        preds = preds[keep_y]
+                        gts = gts[keep_y]
+                        obs = obs[keep_y]
+                        # Keep data_points in sync for CI plotting
+                        if isinstance(data_points, list) and len(data_points) == len(keep_y):
+                            data_points = [dp for dp, k in zip(data_points, keep_y.tolist()) if k]
+                    except Exception:
+                        pass
+
+                # If filtering removed everything, skip plotting this var/depth.
+                if len(times_dt) == 0:
+                    continue
                 
+                # Extract and save corresponding context (input window) data for selected predictions
                 if context_seq_row is not None and save_path is not None:
                     self._save_context_for_predictions(
                         data_points=data_points,
@@ -946,6 +1320,27 @@ class IrregularGridPlotter:
 
                 dates = pd.DatetimeIndex(times_dt).date
 
+                # with open("lake_dates_output.txt", "a") as f:
+                #     f.write(f"Lake name: {lake_name}\n")
+                #     f.write(f"Dates: {dates}\n")
+                #     f.write("-" * 20 + "\n")
+                # exit(0)
+                # breakpoint()
+                # # Post-processing: start from a fixed date and take exactly pred_len points: i:i+pred_len
+                # START_DATE_STR = "2018-09-26"
+                # times_dt = pd.to_datetime(times, utc=True)
+                # # Root cause of previous crash: the exact date often doesn't exist for the chosen (var, depth),
+                # # so np.where(...)[0] can be empty. Fix: start from the first timestamp ON/AFTER the date.
+                # dates_norm = pd.DatetimeIndex(times_dt).normalize().values
+                # start_norm = pd.to_datetime(START_DATE_STR, utc=True).normalize().to_datetime64()
+                # i0 = int(np.searchsorted(dates_norm, start_norm, side="left"))
+                # pl = int(pred_len)
+                # times_dt = times_dt[i0:i0 + pl]
+                # preds = preds[i0:i0 + pl]
+                # gts = gts[i0:i0 + pl]
+                # data_points = data_points[i0:i0 + pl]
+                # dates = pd.DatetimeIndex(times_dt).date
+                
                 # Apply vertical offset to predictions if specified (useful for visual comparison)
                 preds_offset = preds + pred_offset
 
@@ -961,20 +1356,25 @@ class IrregularGridPlotter:
                                edgecolors='white', linewidths=0.5,
                                label=f"Pred @ depth={depth_label}")
                 else:
-                    ax.plot(dates, preds_offset, color=pred_color, linewidth=2, markersize=8.5, linestyle='--',
-                            marker=pred_marker,
-                            label=f"Pred @ depth={depth_label}")
+                    ax.plot(dates, preds_offset, color=pred_color, linewidth=2.5, linestyle='-',
+                            marker=None,
+                            label=f"Pred @ depth={depth_label}", zorder=2)
                 
-                if plot_type == 'scatter':
-                    ax.scatter(dates, gts, color=gt_color, marker=gt_marker, s=34, alpha=0.85,
-                               edgecolors='white', linewidths=0.5, label=f"GT @ depth={depth_label}")
-                else:
-                    ax.plot(dates, gts, color=gt_color, linewidth=2, linestyle='-',
-                            marker=gt_marker, markersize=8.5, alpha=0.9, label=f"GT @ depth={depth_label}")
+                # GT is typically sparse on the regular daily grid; only plot observed points as markers.
+                try:
+                    obs_idx = np.where(obs.astype(bool))[0]
+                except Exception:
+                    obs_idx = np.arange(len(gts), dtype=int)
+                if obs_idx.size > 0:
+                    ax.scatter(np.asarray(dates)[obs_idx], gts[obs_idx],
+                               color=gt_color, marker=gt_marker, s=60, alpha=0.95,
+                               edgecolors='white', linewidths=0.7,
+                               label=f"GT (obs) @ depth={depth_label}", zorder=3)
 
                 if plot_interval and has_distribution and 'lower' in data_points[0]:
                     lowers = np.array([d['lower'] for d in data_points])
                     uppers = np.array([d['upper'] for d in data_points])
+                    # Apply same offset to confidence intervals
                     ax.fill_between(dates, lowers + pred_offset, uppers + pred_offset, color=pred_color, alpha=0.2,
                                     label=f"{int(confidence_level*100)}% CI @ depth={depth_label}")
             
@@ -984,16 +1384,20 @@ class IrregularGridPlotter:
             else:
                 ax.set_ylabel('')
 
-            if ymin is not None or ymax is not None:
-                try:
-                    y0, y1 = ax.get_ylim()
-                    y0 = float(ymin) if ymin is not None else y0
-                    y1 = float(ymax) if ymax is not None else y1
-                    if y0 < y1:
-                        ax.set_ylim(y0, y1)
-                except Exception:
-                    pass
+            # Optional fixed y-limits for consistent scale across plots
+            # NOTE: Disabled for now to allow each variable to auto-scale independently.
+            # If you want fixed y-limits again, re-enable this block.
+            # if ymin is not None or ymax is not None:
+            #     try:
+            #         y0, y1 = ax.get_ylim()
+            #         y0 = float(ymin) if ymin is not None else y0
+            #         y1 = float(ymax) if ymax is not None else y1
+            #         if y0 < y1:
+            #             ax.set_ylim(y0, y1)
+            #     except Exception:
+            #         pass
 
+            # Optional fixed y-ticks for consistent tick locations across plots
             if ytick_step is not None and (ymin is not None or ymax is not None):
                 try:
                     step = float(ytick_step)
@@ -1006,21 +1410,25 @@ class IrregularGridPlotter:
                 except Exception:
                     pass
 
+            # Optional x-axis suppression (ticks and/or label)
             if show_xlabel:
                 ax.set_xlabel('Date', fontsize=int(axis_label_fontsize))
             else:
                 ax.set_xlabel('')
             ax.legend(loc='best', fontsize=8, framealpha=0.9)
             ax.grid(True, alpha=0.3, linestyle='--', linewidth=0.5)
+            # Always increase tick label size (x and y); x can still be hidden below.
             ax.tick_params(axis='y', labelsize=int(tick_labelsize))
             if show_xticks:
                 ax.tick_params(axis='x', rotation=90, labelsize=int(tick_labelsize))
                 if len(dates) > 30:
                     ax.xaxis.set_major_locator(plt.MaxNLocator(10))
             else:
+                # Hide ticks & tick labels without affecting y-axis formatting
                 ax.set_xticks([])
                 ax.tick_params(axis='x', which='both', bottom=False, top=False, labelbottom=False)
         
+        # Title: Lake X : Forecast at prediction window=<pred_len> at chosen depth (and requested depth if applicable)
         lake_str = lake_name if lake_name is not None else "Lake"
         pred_len_str = str(pred_len) if pred_len is not None else "?"
         ci_note = f" (shaded = {int(confidence_level*100)}% CI)" if has_distribution else ""
@@ -1093,9 +1501,27 @@ class IrregularGridPlotter:
                                                                     context_time_vals_row=None,
                                                                     context_datetime_strs=None,
                                                                     context_mask_row=None):
+        """
+        Multi-horizon variant of plot_forecast_irregular_grid_single_depth_var.
+
+        Produces a 2x2 figure with stitched forecasts at horizons T+1, T+7, T+14, T+21
+        (configurable via `horizons`).
+
+        Stitching logic:
+        - For each forecast window (sample_idx / sidx), collect all (time, pred, gt) points.
+        - For each horizon h, within each window sort by time, dedupe by calendar day,
+          then take the h-th element (h=1 -> T+1, h=7 -> T+7, etc.).
+        - Stitch across windows by sorting the chosen points by time and optionally
+          restricting to the intersection of dates across all horizons.
+
+        Saving:
+        - If save_path is provided, the saved filename is prefixed with `filename_prefix`
+          (default: "t+N_preds").
+        """
         pred_color = "tab:orange"
         gt_color = "tab:blue"
-        pred_marker = "o"
+        # Predictions: line only (no markers) for readability on dense grids.
+        pred_marker = None
         gt_marker = "o"
 
         # Handle predictions - extract mean if distribution dict
@@ -1104,7 +1530,7 @@ class IrregularGridPlotter:
             preds_mean = preds_row['mean'].detach().cpu().numpy()
             preds_loc = preds_row['loc'].detach().cpu().numpy()
             preds_scale = preds_row['scale'].detach().cpu().numpy()
-            preds_df = preds_row['df'].detach().cpu().numpy()
+            preds_df = preds_row['df'].detach().cpu().numpy() if ('df' in preds_row and preds_row['df'] is not None) else None
         else:
             has_distribution = False
             preds_mean = preds_row.detach().cpu().numpy() if hasattr(preds_row, 'detach') else np.asarray(preds_row)
@@ -1120,22 +1546,54 @@ class IrregularGridPlotter:
         # Collect points per (var, depth)
         var_depth_data = {}
         for sidx in range(num_samples):
-            sample_mask = mask[sidx].astype(bool)
-            valid_idx = np.where(sample_mask)[0]
-            if valid_idx.size == 0:
+            # IMPORTANT (regular daily-grid Y):
+            # - `mask_row`/`mask` indicates where GT is observed (1) vs missing (0)
+            # - predictions exist for *all* query tokens on the dense grid
+            # So: select tokens by "non-padding" (valid datetime), and keep `mask` as an
+            # "observed GT" indicator for plotting.
+            obs_mask = mask[sidx].astype(bool)
+
+            times_all = np.asarray(datetime_raw_vals[sidx])
+            if times_all.size == 0:
                 continue
 
-            sample_gt = gt[sidx, valid_idx]
-            sample_preds = preds_mean[sidx, valid_idx]
-            sample_times = datetime_raw_vals[sidx, valid_idx]
-            sample_depths = depth_vals[sidx, valid_idx]
-            sample_vars = var_ids[sidx, valid_idx]
+            token_idx = None
+            try:
+                if np.issubdtype(times_all.dtype, np.datetime64):
+                    token_idx = np.where(~np.isnat(times_all))[0]
+            except Exception:
+                token_idx = None
+
+            if token_idx is None:
+                try:
+                    as_str = np.array(
+                        [
+                            (t.decode("utf-8") if isinstance(t, (bytes, bytearray)) else str(t))
+                            for t in times_all
+                        ],
+                        dtype=object
+                    )
+                    bad = (as_str == "") | (as_str == "NaT") | (as_str == "None") | (as_str == "nan")
+                    token_idx = np.where(~bad)[0]
+                except Exception:
+                    token_idx = np.arange(times_all.shape[0], dtype=int)
+
+            if token_idx.size == 0:
+                continue
+
+            sample_gt = gt[sidx, token_idx]
+            sample_preds = preds_mean[sidx, token_idx]
+            sample_times = times_all[token_idx]
+            sample_depths = depth_vals[sidx, token_idx]
+            sample_vars = var_ids[sidx, token_idx]
+            sample_obs = obs_mask[token_idx]
 
             if has_distribution:
-                sample_loc = preds_loc[sidx, valid_idx]
-                sample_scale = preds_scale[sidx, valid_idx]
-                sample_df = preds_df[sidx, valid_idx]
+                sample_loc = preds_loc[sidx, token_idx]
+                sample_scale = preds_scale[sidx, token_idx]
+                sample_df = preds_df[sidx, token_idx]
 
+            # For multi-horizon, keep all horizon points (do not collapse to "first pred")
             if filter_first_pred and len(sample_times) > 0:
                 if isinstance(sample_times[0], bytes):
                     times_str = np.array([t.decode("utf-8") for t in sample_times], dtype=object)
@@ -1159,6 +1617,7 @@ class IrregularGridPlotter:
                 sample_times = sample_times[keep_idx]
                 sample_depths = sample_depths[keep_idx]
                 sample_vars = sample_vars[keep_idx]
+                sample_obs = sample_obs[keep_idx]
 
                 if has_distribution:
                     sample_loc = sample_loc[keep_idx]
@@ -1178,14 +1637,18 @@ class IrregularGridPlotter:
                     df_val = sample_df[i]
 
                     alpha = 1 - confidence_level
-                    t_dist = stats.t(df=df_val, loc=loc, scale=scale)
-                    lower = t_dist.ppf(alpha / 2)
-                    upper = t_dist.ppf(1 - alpha / 2)
+                    if df_val is None:
+                        t_dist = stats.norm(loc=loc, scale=scale)
+                    else:
+                        t_dist = stats.t(df=df_val, loc=loc, scale=scale)
+                        lower = t_dist.ppf(alpha / 2)
+                        upper = t_dist.ppf(1 - alpha / 2)
 
                     var_depth_data[key].append({
                         'time': sample_times[i],
                         'pred': sample_preds[i],
                         'gt': sample_gt[i],
+                        'obs': bool(sample_obs[i]),
                         'lower': lower,
                         'upper': upper,
                         'sample_idx': sidx
@@ -1195,6 +1658,7 @@ class IrregularGridPlotter:
                         'time': sample_times[i],
                         'pred': sample_preds[i],
                         'gt': sample_gt[i],
+                        'obs': bool(sample_obs[i]),
                         'sample_idx': sidx
                     })
 
@@ -1202,6 +1666,7 @@ class IrregularGridPlotter:
             print("No valid data to plot")
             return
 
+        # Variable selection (match existing behavior)
         unique_vars = sorted(set([k[0] for k in var_depth_data.keys()]))
         if var_names_subset is None:
             var_names_subset = ["WaterTemp_C"]
@@ -1217,6 +1682,8 @@ class IrregularGridPlotter:
             print("No valid data to plot")
             return
 
+        # Keep parity with the "single_depth_var" function: one subplot per selected var,
+        # but for multi-horizon we typically plot just the first selected variable.
         var_id = unique_vars[0]
         depths_for_var = sorted(set([k[1] for k in var_depth_data.keys() if k[0] == var_id]))
         if len(depths_for_var) == 0:
@@ -1276,6 +1743,7 @@ class IrregularGridPlotter:
             if len(chosen) == 0:
                 return None
 
+            # Stitch across windows: sort and dedupe by day again
             times_dt = _to_times_dt([x['time'] for x in chosen])
             order = np.argsort(pd.DatetimeIndex(times_dt).astype("int64")).astype(int)
             times_dt = times_dt[order]
@@ -1289,13 +1757,29 @@ class IrregularGridPlotter:
             dates = pd.DatetimeIndex(times_dt).date
             preds = np.array([x['pred'] for x in chosen]) + pred_offset
             gts = np.array([x['gt'] for x in chosen])
+            obs = np.array([bool(x.get('obs', True)) for x in chosen], dtype=bool)
 
             lowers = uppers = None
             if has_distribution and plot_interval and 'lower' in chosen[0]:
                 lowers = np.array([x['lower'] for x in chosen]) + pred_offset
                 uppers = np.array([x['upper'] for x in chosen]) + pred_offset
 
-            return dates, preds, gts, lowers, uppers
+            # Keep plots readable: only take first pred_len points if provided (parity with old function)
+            # if pred_len is not None:
+            #     try:
+            #         pl = int(pred_len)
+            #         if pl > 0:
+            #             dates = dates[:pl]
+            #             preds = preds[:pl]
+            #             gts = gts[:pl]
+            #             if lowers is not None:
+            #                 lowers = lowers[:pl]
+            #             if uppers is not None:
+            #                 uppers = uppers[:pl]
+            #     except Exception:
+            #         pass
+
+            return dates, preds, gts, obs, lowers, uppers
 
         # Build series for each horizon
         series_by_h = {}
@@ -1308,12 +1792,16 @@ class IrregularGridPlotter:
             print("No valid horizon series to plot")
             return
 
+        # Optional: force all horizons onto a shared timeline.
+        # Prefer intersecting the DATE RANGE rather than exact date set intersection, to avoid
+        # collapsing to a tiny set when timestamps are irregular.
         if use_common_intersection and len(series_by_h) > 1:
             mode = str(intersection_mode or "range").lower()
             if mode not in {"range", "set"}:
                 mode = "range"
 
             if mode == "range":
+                # Compute overlap interval [max(starts), min(ends)]
                 starts = []
                 ends = []
                 for h, (dates, *_rest) in series_by_h.items():
@@ -1326,7 +1814,7 @@ class IrregularGridPlotter:
                     start = max(starts)
                     end = min(ends)
                     if start <= end:
-                        for h, (dates, preds, gts, lowers, uppers) in list(series_by_h.items()):
+                        for h, (dates, preds, gts, obs, lowers, uppers) in list(series_by_h.items()):
                             if dates is None or len(dates) == 0:
                                 continue
                             d = pd.to_datetime(np.array(dates, dtype=object)).normalize()
@@ -1336,30 +1824,35 @@ class IrregularGridPlotter:
                                 np.asarray(dates, dtype=object)[keep],
                                 np.asarray(preds)[keep],
                                 np.asarray(gts)[keep],
+                                np.asarray(obs, dtype=bool)[keep],
                                 (np.asarray(lowers)[keep] if lowers is not None else None),
                                 (np.asarray(uppers)[keep] if uppers is not None else None),
                             )
             else:
+                # Exact set intersection (stricter; can be very small on irregular data)
                 date_sets = [set(map(str, series_by_h[h][0])) for h in series_by_h.keys()]
                 common = set.intersection(*date_sets) if len(date_sets) > 0 else set()
                 if len(common) > 0:
-                    for h, (dates, preds, gts, lowers, uppers) in list(series_by_h.items()):
+                    for h, (dates, preds, gts, obs, lowers, uppers) in list(series_by_h.items()):
                         keep = np.array([str(d) in common for d in dates], dtype=bool)
                         series_by_h[h] = (
                             np.asarray(dates, dtype=object)[keep],
                             np.asarray(preds)[keep],
                             np.asarray(gts)[keep],
+                            np.asarray(obs, dtype=bool)[keep],
                             (np.asarray(lowers)[keep] if lowers is not None else None),
                             (np.asarray(uppers)[keep] if uppers is not None else None),
                         )
 
+        # Plot 2x2 (requested horizons in order if present)
         requested_order = [1, 7, 14, 21]
         hs = [h for h in requested_order if h in series_by_h]
         for h in sorted(series_by_h.keys()):
             if h not in hs:
                 hs.append(h)
 
-        fig, axes = plt.subplots(2, 2, figsize=(14, 8), sharex=True)
+        # Larger canvas for dense daily grids + multi-horizon view
+        fig, axes = plt.subplots(2, 2, figsize=(20, 12), sharex=True)
         axes = axes.flatten()
 
         lake_str = lake_name if lake_name is not None else "Lake"
@@ -1375,18 +1868,32 @@ class IrregularGridPlotter:
                 continue
 
             h = hs[ax_i]
-            dates, preds, gts, lowers, uppers = series_by_h[h]
+            dates, preds, gts, obs, lowers, uppers = series_by_h[h]
 
             if plot_type == 'scatter':
                 ax.scatter(dates, preds, color=pred_color, marker=pred_marker, s=28, alpha=0.85,
                            edgecolors='white', linewidths=0.5, label="Pred")
-                ax.scatter(dates, gts, color=gt_color, marker=gt_marker, s=28, alpha=0.85,
-                           edgecolors='white', linewidths=0.5, label="GT")
+                # Plot GT only where observed (sparse markers)
+                try:
+                    obs_idx = np.where(np.asarray(obs, dtype=bool))[0]
+                except Exception:
+                    obs_idx = np.arange(len(gts), dtype=int)
+                if obs_idx.size > 0:
+                    ax.scatter(np.asarray(dates, dtype=object)[obs_idx], np.asarray(gts)[obs_idx],
+                               color=gt_color, marker=gt_marker, s=28, alpha=0.85,
+                               edgecolors='white', linewidths=0.5, label="GT (obs)")
             else:
-                ax.plot(dates, preds, color=pred_color, linewidth=2, linestyle='--',
-                        marker=pred_marker, markersize=8.5, label="Pred")
-                ax.plot(dates, gts, color=gt_color, linewidth=2, linestyle='-',
-                        marker=gt_marker, markersize=8.5, alpha=0.9, label="GT")
+                ax.plot(dates, preds, color=pred_color, linewidth=2.5, linestyle='-',
+                        marker=None, label="Pred", zorder=2)
+                # Plot GT only where observed (sparse markers)
+                try:
+                    obs_idx = np.where(np.asarray(obs, dtype=bool))[0]
+                except Exception:
+                    obs_idx = np.arange(len(gts), dtype=int)
+                if obs_idx.size > 0:
+                    ax.scatter(np.asarray(dates, dtype=object)[obs_idx], np.asarray(gts)[obs_idx],
+                               color=gt_color, marker=gt_marker, s=55, alpha=0.95,
+                               edgecolors='white', linewidths=0.7, label="GT (obs)", zorder=3)
 
             if lowers is not None and uppers is not None and len(dates) > 0:
                 ax.fill_between(dates, lowers, uppers, color=pred_color, alpha=0.2, label="CI")
@@ -1439,7 +1946,7 @@ class IrregularGridPlotter:
                     }
                 }
                 
-                for h, (dates, preds, gts, lowers, uppers) in series_by_h.items():
+                for h, (dates, preds, gts, obs, lowers, uppers) in series_by_h.items():
                     # Convert dates to strings for JSON serialization
                     dates_str = [str(d) for d in dates] if dates is not None and len(dates) > 0 else []
                     
@@ -1447,6 +1954,7 @@ class IrregularGridPlotter:
                         'dates': dates_str,
                         'predictions': preds.tolist() if preds is not None and len(preds) > 0 else [],
                         'ground_truth': gts.tolist() if gts is not None and len(gts) > 0 else [],
+                        'ground_truth_observed_mask': obs.tolist() if obs is not None and len(obs) > 0 else [],
                         'num_points': len(dates_str),
                     }
                     
@@ -1476,6 +1984,448 @@ class IrregularGridPlotter:
         wandb.log({title: wandb.Image(plt)})
         plt.close()
     
+    def plot_forecast_irregular_grid_single_depth_var_tplusn_average(self,
+                                                                     gt_row,
+                                                                     preds_row,
+                                                                     time_vals_row,
+                                                                     datetime_raw_vals,
+                                                                     depth_vals_row,
+                                                                     var_ids_row,
+                                                                     mask_row,
+                                                                     feature_dict,
+                                                                     sample_idx,
+                                                                     plt_idx,
+                                                                     epoch,
+                                                                     train_or_val,
+                                                                     title_prefix="T+n Avg Forecast",
+                                                                     plot_type='line',
+                                                                     max_features=6,
+                                                                     max_depths_per_feature=6,
+                                                                     depth_units=None,
+                                                                     var_names_subset=None,
+                                                                     depth_index=1,
+                                                                     pred_len=None,
+                                                                     lake_name=None,
+                                                                     confidence_level=0.95,
+                                                                     plot_interval=True,
+                                                                     save_path=None,
+                                                                     depth_name=1.5,
+                                                                     pred_offset=0.0,
+                                                                     horizon_start: int = 1,
+                                                                     horizon_end: int = 14,
+                                                                     require_all_horizons: bool = False,
+                                                                     use_common_intersection: bool = False,
+                                                                     intersection_mode: str = "range",
+                                                                     filename_prefix: str = "tplusn_avg",
+                                                                     # Context (input X) data for baseline comparison (accepted for call-site compatibility)
+                                                                     context_seq_row=None,
+                                                                     context_var_ids_row=None,
+                                                                     context_depth_vals_row=None,
+                                                                     context_time_vals_row=None,
+                                                                     context_datetime_strs=None,
+                                                                     context_mask_row=None):
+        """
+        Plot a stitched time-series where the prediction at each day is the *average* across horizons T+h
+        for h in [horizon_start, horizon_end].
+        
+        This is useful when the default stitched plot (which is effectively T+1) hides the fact that
+        longer-horizon predictions may be flatter.
+        
+        Mechanism (mirrors multi-horizon stitching):
+        - For each horizon h, build a stitched series by taking the h-th day (after day-dedup) inside each window,
+          then stitch across windows.
+        - Align horizon series by calendar day and take the mean prediction per day.
+        
+        Args:
+            horizon_start: First horizon index (e.g., 1 for T+1)
+            horizon_end: Last horizon index (e.g., 14 for T+14)
+            require_all_horizons: If True, only keep days where *all* horizons contribute a prediction.
+            use_common_intersection: If True, first restrict all horizon series to a shared timeline intersection
+                ("range" or "set") before averaging.
+        """
+        pred_color = "tab:orange"
+        gt_color = "tab:blue"
+        pred_marker = None
+        gt_marker = "o"
+
+        # Handle predictions - extract mean if distribution dict
+        if isinstance(preds_row, dict):
+            has_distribution = True
+            preds_mean = preds_row['mean'].detach().cpu().numpy()
+            preds_loc = preds_row.get('loc', None)
+            preds_scale = preds_row.get('scale', None)
+            preds_df = preds_row.get('df', None)
+            preds_loc = preds_loc.detach().cpu().numpy() if hasattr(preds_loc, 'detach') else np.asarray(preds_loc)
+            preds_scale = preds_scale.detach().cpu().numpy() if hasattr(preds_scale, 'detach') else np.asarray(preds_scale)
+            preds_df = preds_df.detach().cpu().numpy() if hasattr(preds_df, 'detach') else np.asarray(preds_df)
+        else:
+            has_distribution = False
+            preds_mean = preds_row.detach().cpu().numpy() if hasattr(preds_row, 'detach') else np.asarray(preds_row)
+
+        # Convert to numpy
+        gt = gt_row.detach().cpu().numpy() if hasattr(gt_row, 'detach') else np.asarray(gt_row)
+        depth_vals = depth_vals_row.detach().cpu().numpy() if hasattr(depth_vals_row, 'detach') else np.asarray(depth_vals_row)
+        var_ids = var_ids_row.detach().cpu().numpy() if hasattr(var_ids_row, 'detach') else np.asarray(var_ids_row)
+        mask = mask_row.detach().cpu().numpy() if hasattr(mask_row, 'detach') else np.asarray(mask_row)
+
+        num_samples = gt.shape[0]
+
+        # Collect points per (var, depth)
+        var_depth_data = {}
+        for sidx in range(num_samples):
+            obs_mask = mask[sidx].astype(bool)
+            times_all = np.asarray(datetime_raw_vals[sidx])
+            if times_all.size == 0:
+                continue
+
+            token_idx = None
+            try:
+                if np.issubdtype(times_all.dtype, np.datetime64):
+                    token_idx = np.where(~np.isnat(times_all))[0]
+            except Exception:
+                token_idx = None
+            if token_idx is None:
+                try:
+                    as_str = np.array(
+                        [
+                            (t.decode("utf-8") if isinstance(t, (bytes, bytearray)) else str(t))
+                            for t in times_all
+                        ],
+                        dtype=object
+                    )
+                    bad = (as_str == "") | (as_str == "NaT") | (as_str == "None") | (as_str == "nan")
+                    token_idx = np.where(~bad)[0]
+                except Exception:
+                    token_idx = np.arange(times_all.shape[0], dtype=int)
+            if token_idx.size == 0:
+                continue
+
+            sample_gt = gt[sidx, token_idx]
+            sample_preds = preds_mean[sidx, token_idx]
+            sample_times = times_all[token_idx]
+            sample_depths = depth_vals[sidx, token_idx]
+            sample_vars = var_ids[sidx, token_idx]
+            sample_obs = obs_mask[token_idx]
+
+            for i in range(len(sample_times)):
+                lower = upper = scale_val = None
+                if has_distribution and bool(plot_interval):
+                    try:
+                        loc = float(preds_loc[sidx, token_idx][i])
+                        scale_val = float(preds_scale[sidx, token_idx][i])
+                        df_val = float(preds_df[sidx, token_idx][i])
+                        alpha = 1.0 - float(confidence_level)
+                        t_dist = stats.t(df=df_val, loc=loc, scale=scale_val)
+                        lower = float(t_dist.ppf(alpha / 2.0))
+                        upper = float(t_dist.ppf(1.0 - alpha / 2.0))
+                    except Exception:
+                        lower = upper = None
+                        scale_val = None
+                var_id = int(sample_vars[i])
+                depth = float(sample_depths[i])
+                key = (var_id, depth)
+                if key not in var_depth_data:
+                    var_depth_data[key] = []
+                var_depth_data[key].append({
+                    'time': sample_times[i],
+                    'pred': float(sample_preds[i]),
+                    'gt': float(sample_gt[i]),
+                    'obs': bool(sample_obs[i]),
+                    'sample_idx': sidx,
+                    'lower': lower,
+                    'upper': upper,
+                    'scale': scale_val,
+                })
+
+        unique_vars = sorted(set([k[0] for k in var_depth_data.keys()]))
+        if var_names_subset is None:
+            var_names_subset = ["WaterTemp_C"]
+        if var_names_subset is not None:
+            name_to_id = {vname: int(vid) for vid, vname in feature_dict.items()}
+            selected_var_ids = [name_to_id[name] for name in var_names_subset if name in name_to_id]
+            if len(selected_var_ids) > 0:
+                unique_vars = [vid for vid in unique_vars if vid in set(selected_var_ids)]
+        unique_vars = unique_vars[:max_features]
+
+        if len(unique_vars) == 0:
+            print("No valid data to plot")
+            return
+
+        # Helpers for horizon series
+        def _to_times_dt(times):
+            if len(times) == 0:
+                return pd.to_datetime(np.array([], dtype=object), utc=True)
+            if isinstance(times[0], bytes):
+                times_str = [t.decode("utf-8") for t in times]
+            else:
+                times_str = [str(t) for t in times]
+            return pd.to_datetime(np.array(times_str, dtype=object), utc=True)
+
+        def _dedupe_by_day(times_dt, idxs):
+            dti = pd.DatetimeIndex(times_dt)
+            if dti.tz is not None:
+                dti = dti.tz_convert("UTC").tz_localize(None)
+            day = dti.normalize().to_numpy(dtype="datetime64[ns]")
+            _, first_idx = np.unique(day, return_index=True)
+            first_idx = np.sort(first_idx)
+            return idxs[first_idx]
+
+        def _series_for_horizon(points_list, h):
+            by_sample = {}
+            for p in points_list:
+                by_sample.setdefault(int(p['sample_idx']), []).append(p)
+
+            chosen = []
+            for _sidx, lst in by_sample.items():
+                times_dt = _to_times_dt([x['time'] for x in lst])
+                if len(times_dt) == 0:
+                    continue
+                order = np.argsort(pd.DatetimeIndex(times_dt).astype("int64")).astype(int)
+                order = _dedupe_by_day(times_dt[order], order)
+                if len(order) < int(h):
+                    continue
+                chosen.append(lst[int(order[int(h) - 1])])
+
+            if len(chosen) == 0:
+                return None
+
+            times_dt = _to_times_dt([x['time'] for x in chosen])
+            order = np.argsort(pd.DatetimeIndex(times_dt).astype("int64")).astype(int)
+            times_dt = times_dt[order]
+            chosen = [chosen[i] for i in order.tolist()]
+
+            idxs = np.arange(len(chosen), dtype=int)
+            idxs = _dedupe_by_day(times_dt, idxs)
+            times_dt = times_dt[idxs]
+            chosen = [chosen[i] for i in idxs.tolist()]
+
+            dates = pd.DatetimeIndex(times_dt).date
+            preds = np.array([x['pred'] for x in chosen], dtype=float) + float(pred_offset)
+            gts = np.array([x['gt'] for x in chosen], dtype=float)
+            obs = np.array([bool(x.get('obs', True)) for x in chosen], dtype=bool)
+            lowers = uppers = scales = None
+            if has_distribution and bool(plot_interval):
+                try:
+                    lowers = np.array([x.get('lower', np.nan) for x in chosen], dtype=float) + float(pred_offset)
+                    uppers = np.array([x.get('upper', np.nan) for x in chosen], dtype=float) + float(pred_offset)
+                    scales = np.array([x.get('scale', np.nan) for x in chosen], dtype=float)
+                except Exception:
+                    lowers = uppers = scales = None
+            return dates, preds, gts, obs, lowers, uppers, scales
+
+        # Plot setup
+        fig, axes = plt.subplots(len(unique_vars), 1, figsize=(18, 6 * len(unique_vars)))
+        if len(unique_vars) == 1:
+            axes = [axes]
+
+        hs = list(range(int(horizon_start), int(horizon_end) + 1))
+        hs = [h for h in hs if h >= 1]
+        if len(hs) == 0:
+            print("No valid horizons requested")
+            return
+
+        for ax, var_id in zip(axes, unique_vars):
+            depths_for_var = sorted(set([k[1] for k in var_depth_data.keys() if k[0] == var_id]))
+            if len(depths_for_var) == 0:
+                continue
+
+            # Choose one depth per var (same selection logic as single_depth_var)
+            requested_depth_m = None
+            du = (str(depth_units).lower() if depth_units is not None else "")
+            if du in ("m", "meter", "meters"):
+                try:
+                    requested_depth_m = float(depth_name)
+                except Exception:
+                    requested_depth_m = None
+
+            if requested_depth_m is not None:
+                chosen_depth = float(min(depths_for_var, key=lambda d: abs(float(d) - requested_depth_m)))
+            else:
+                try:
+                    di = int(depth_index)
+                except Exception:
+                    di = 0
+                if di < 0:
+                    di = 0
+                if di >= len(depths_for_var):
+                    di = len(depths_for_var) - 1
+                chosen_depth = float(depths_for_var[di])
+
+            key = (var_id, chosen_depth)
+            if key not in var_depth_data:
+                continue
+
+            points = var_depth_data[key]
+
+            # Build series per horizon
+            series_by_h = {}
+            for h in hs:
+                out = _series_for_horizon(points, int(h))
+                if out is not None:
+                    series_by_h[int(h)] = out
+
+            if len(series_by_h) == 0:
+                ax.text(0.5, 0.5, "No valid horizon series", ha="center", va="center", transform=ax.transAxes)
+                continue
+
+            # Optional intersection restriction (range or exact set)
+            if use_common_intersection and len(series_by_h) > 1:
+                mode = str(intersection_mode or "range").lower()
+                if mode not in {"range", "set"}:
+                    mode = "range"
+                if mode == "range":
+                    starts = []
+                    ends = []
+                    for _h, (dates, *_rest) in series_by_h.items():
+                        if dates is None or len(dates) == 0:
+                            continue
+                        d = pd.to_datetime(np.array(dates, dtype=object)).normalize()
+                        starts.append(d.min())
+                        ends.append(d.max())
+                    if len(starts) > 0 and len(ends) > 0:
+                        start = max(starts)
+                        end = min(ends)
+                        if start <= end:
+                            for _h, (dates, preds, gts, obs, lowers, uppers, scales) in list(series_by_h.items()):
+                                d = pd.to_datetime(np.array(dates, dtype=object)).normalize()
+                                keep = (d >= start) & (d <= end)
+                                keep = np.asarray(keep, dtype=bool)
+                                series_by_h[_h] = (
+                                    np.asarray(dates, dtype=object)[keep],
+                                    np.asarray(preds)[keep],
+                                    np.asarray(gts)[keep],
+                                    np.asarray(obs, dtype=bool)[keep],
+                                    (np.asarray(lowers)[keep] if lowers is not None else None),
+                                    (np.asarray(uppers)[keep] if uppers is not None else None),
+                                    (np.asarray(scales)[keep] if scales is not None else None),
+                                )
+                else:
+                    date_sets = [set(map(str, series_by_h[h][0])) for h in series_by_h.keys()]
+                    common = set.intersection(*date_sets) if len(date_sets) > 0 else set()
+                    if len(common) > 0:
+                        for _h, (dates, preds, gts, obs, lowers, uppers, scales) in list(series_by_h.items()):
+                            keep = np.array([str(d) in common for d in dates], dtype=bool)
+                            series_by_h[_h] = (
+                                np.asarray(dates, dtype=object)[keep],
+                                np.asarray(preds)[keep],
+                                np.asarray(gts)[keep],
+                                np.asarray(obs, dtype=bool)[keep],
+                                (np.asarray(lowers)[keep] if lowers is not None else None),
+                                (np.asarray(uppers)[keep] if uppers is not None else None),
+                                (np.asarray(scales)[keep] if scales is not None else None),
+                            )
+
+            # Align by day and average predictions across horizons
+            pred_map = {}
+            gt_map = {}
+            obs_map = {}
+            lower_map = {}
+            upper_map = {}
+            std_map = {}
+            horizon_date_maps = {}
+            for h, (dates, preds, gts, obs, lowers, uppers, scales) in series_by_h.items():
+                dkeys = [str(d) for d in dates]
+                horizon_date_maps[h] = set(dkeys)
+                for j, (dk, pr, gt_v, ob) in enumerate(zip(dkeys, preds.tolist(), gts.tolist(), obs.tolist())):
+                    pred_map.setdefault(dk, []).append(float(pr))
+                    if dk not in gt_map:
+                        gt_map[dk] = float(gt_v)
+                        obs_map[dk] = bool(ob)
+                    else:
+                        # If any horizon has an observed GT at this day, keep it observed.
+                        obs_map[dk] = bool(obs_map[dk]) or bool(ob)
+                    if has_distribution and bool(plot_interval):
+                        try:
+                            if lowers is not None:
+                                lower_map.setdefault(dk, []).append(float(lowers[j]))
+                            if uppers is not None:
+                                upper_map.setdefault(dk, []).append(float(uppers[j]))
+                            if scales is not None:
+                                std_map.setdefault(dk, []).append(float(scales[j]))
+                        except Exception:
+                            pass
+
+            all_dates = sorted(pred_map.keys())
+            if require_all_horizons:
+                required = set.intersection(*[horizon_date_maps[h] for h in horizon_date_maps.keys()]) if len(horizon_date_maps) > 0 else set()
+                all_dates = [d for d in all_dates if d in required]
+
+            if len(all_dates) == 0:
+                ax.text(0.5, 0.5, "No aligned dates to average", ha="center", va="center", transform=ax.transAxes)
+                continue
+
+            dates_out = np.array([pd.to_datetime(d).date() for d in all_dates], dtype=object)
+            preds_avg = np.array([float(np.mean(pred_map[d])) for d in all_dates], dtype=float)
+            gts_out = np.array([gt_map.get(d, np.nan) for d in all_dates], dtype=float)
+            obs_out = np.array([bool(obs_map.get(d, True)) for d in all_dates], dtype=bool)
+
+            label = f"Avg T+{hs[0]}..T+{hs[-1]} (K={len(series_by_h)})"
+            if plot_type == 'scatter':
+                ax.scatter(dates_out, preds_avg, color=pred_color, marker=pred_marker, s=34, alpha=0.85,
+                           edgecolors='white', linewidths=0.5, label=label)
+            else:
+                ax.plot(dates_out, preds_avg, color=pred_color, linewidth=2.5, linestyle='-',
+                        marker=None, label=label, zorder=2)
+
+            # Avg CI band (simple average of per-horizon bounds) + avg std (not plotted, but computed in case needed)
+            if has_distribution and bool(plot_interval) and len(all_dates) > 0:
+                try:
+                    lower_avg = np.array([float(np.mean(lower_map[d])) for d in all_dates if d in lower_map and len(lower_map[d]) > 0], dtype=float)
+                    upper_avg = np.array([float(np.mean(upper_map[d])) for d in all_dates if d in upper_map and len(upper_map[d]) > 0], dtype=float)
+                    keep_ci = np.array([(d in lower_map and len(lower_map[d]) > 0 and d in upper_map and len(upper_map[d]) > 0) for d in all_dates], dtype=bool)
+                    if np.any(keep_ci):
+                        ax.fill_between(
+                            np.asarray(dates_out, dtype=object)[keep_ci],
+                            np.array([float(np.mean(lower_map[d])) for d in np.asarray(all_dates, dtype=object)[keep_ci]], dtype=float),
+                            np.array([float(np.mean(upper_map[d])) for d in np.asarray(all_dates, dtype=object)[keep_ci]], dtype=float),
+                            color=pred_color,
+                            alpha=0.2,
+                            label=f"{int(float(confidence_level)*100)}% CI (avg across horizons)",
+                        )
+                    # compute avg std for potential debugging/use
+                    _avg_std = np.array([float(np.mean(std_map[d])) for d in all_dates if d in std_map and len(std_map[d]) > 0], dtype=float) if len(std_map) > 0 else None
+                except Exception:
+                    pass
+
+            # GT markers (observed only)
+            try:
+                obs_idx = np.where(obs_out.astype(bool))[0]
+            except Exception:
+                obs_idx = np.arange(len(gts_out), dtype=int)
+            if obs_idx.size > 0:
+                ax.scatter(np.asarray(dates_out)[obs_idx], gts_out[obs_idx],
+                           color=gt_color, marker=gt_marker, s=60, alpha=0.95,
+                           edgecolors='white', linewidths=0.7, label="GT (obs)", zorder=3)
+
+            var_name = feature_dict.get(var_id, f"Var_{var_id}")
+            ax.set_ylabel(var_name, fontsize=20)
+            ax.grid(True, alpha=0.3)
+            ax.legend(fontsize=12, loc="best")
+
+        lake_str = f"{lake_name}" if lake_name is not None else ""
+        title = f"{title_prefix}: {train_or_val} epoch {epoch} {lake_str}".strip()
+        plt.suptitle(title, fontsize=14, y=1.0)
+        plt.tight_layout()
+
+        # Save with prefix if requested
+        if save_path is not None:
+            import os
+            save_dir = os.path.dirname(save_path)
+            base = os.path.basename(save_path)
+            if base == "":
+                base = "plot.png"
+            if not base.lower().endswith((".png", ".jpg", ".jpeg", ".pdf")):
+                base = base + ".png"
+            prefixed = f"{filename_prefix}_{base}" if filename_prefix else base
+            final_path = os.path.join(save_dir, prefixed) if save_dir else prefixed
+            if save_dir:
+                os.makedirs(save_dir, exist_ok=True)
+            plt.savefig(final_path, dpi=180, bbox_inches='tight')
+            print(f"Saved T+n-avg irregular forecasts to {final_path}")
+
+        wandb.log({title: wandb.Image(plt)})
+        plt.close()
+
     def plot_single_sample_forecast(self,
                                     inputs_row,
                                     gt_row,
@@ -1501,6 +2451,27 @@ class IrregularGridPlotter:
         Plot context window, ground truth, and predictions for a single sample at a specific depth.
         Shows T+1, T+7, T+14, T+30 predictions in separate rows with uncertainty bands.
         Plots the irregular sequence directly without regular grid assumptions.
+        
+        Args:
+            inputs_row: Input/context values (B, S) - the context window
+            gt_row: Ground truth values (B, S)
+            preds_row: Predictions - can be dict with distribution params or tensor (B, S)
+            time_vals_row: Time values (B, S)
+            datetime_raw_vals: Datetime strings/objects (B, S)
+            depth_vals_row: Depth values (B, S)
+            var_ids_row: Variable IDs (B, S)
+            mask_row: Valid token mask (B, S)
+            feature_dict: Mapping from variable ID to variable name
+            sample_idx: Index of sample to plot (single integer)
+            var_name: Variable name to plot (if None, uses first available)
+            target_depth: Target depth to plot (default: 0.0)
+            context_len: Length of context window (if None, inferred from data)
+            horizons: List of horizons to plot (default: [1, 7, 14, 30])
+            confidence_level: Confidence level for uncertainty bands
+            epoch: Current epoch (for title/logging)
+            train_or_val: 'train' or 'val' (for title/logging)
+            lake_name: Lake name for title
+            save_path: Optional path to save the figure
         """
         # Handle predictions - extract mean and distribution params if available
         if isinstance(preds_row, dict):
@@ -1508,7 +2479,7 @@ class IrregularGridPlotter:
             preds_mean = preds_row['mean'].detach().cpu().numpy()
             preds_loc = preds_row['loc'].detach().cpu().numpy()
             preds_scale = preds_row['scale'].detach().cpu().numpy()
-            preds_df = preds_row['df'].detach().cpu().numpy()
+            preds_df = preds_row['df'].detach().cpu().numpy() if ('df' in preds_row and preds_row['df'] is not None) else None
         else:
             has_distribution = False
             preds_mean = preds_row.detach().cpu().numpy() if hasattr(preds_row, 'detach') else np.asarray(preds_row)
@@ -1594,6 +2565,7 @@ class IrregularGridPlotter:
         
         # Determine context length
         if context_len is None:
+            # Assume first half is context, second half is prediction
             context_len = len(inputs_sorted) // 2
         
         context_end_idx = min(context_len, len(inputs_sorted))
@@ -1633,18 +2605,22 @@ class IrregularGridPlotter:
                 ax.set_title(f"T+{horizon} - {var_display_name} @ depth {target_depth:.2f}")
                 continue
             
+            # Plot full context window (inputs and GT) - irregular sequence
             ax.plot(dates_context, inputs_context, 'o-', color='gray', linewidth=1.5, 
                    markersize=3, alpha=0.7, label='Context (Input)', zorder=1)
             ax.plot(dates_context, gt_context, 's-', color='blue', linewidth=1.5, 
                    markersize=3, alpha=0.7, label='Context (GT)', zorder=1)
             
+            # Plot full prediction window GT (for reference) - irregular sequence
             ax.plot(dates_pred, gt_pred, 's-', color='lightblue', linewidth=1, 
                    markersize=2, alpha=0.5, label='Prediction Window (GT)', zorder=1)
             
+            # Plot prediction at this specific horizon
             pred_date = dates_pred[pos_in_pred_window]
             pred_val = preds_pred[pos_in_pred_window]
             gt_val_at_horizon = gt_pred[pos_in_pred_window]
             
+            # Plot prediction point (larger, more prominent)
             ax.plot(pred_date, pred_val, 'o', color='red', markersize=10, 
                    label=f'T+{horizon} Prediction', zorder=3)
             ax.plot(pred_date, gt_val_at_horizon, 's', color='green', markersize=10, 
@@ -1658,9 +2634,12 @@ class IrregularGridPlotter:
                 
                 # Compute confidence interval
                 alpha = 1 - confidence_level
-                t_dist = stats.t(df=df_val, loc=loc_val, scale=scale_val)
-                lower = t_dist.ppf(alpha / 2)
-                upper = t_dist.ppf(1 - alpha / 2)
+                if df_val is None:
+                    t_dist = stats.norm(loc=loc_val, scale=scale_val)
+                else:
+                    t_dist = stats.t(df=df_val, loc=loc_val, scale=scale_val)
+                    lower = t_dist.ppf(alpha / 2)
+                    upper = t_dist.ppf(1 - alpha / 2)
                 
                 # Plot uncertainty band as vertical error bar
                 ax.errorbar(pred_date, pred_val, yerr=[[pred_val - lower], [upper - pred_val]], 
@@ -1972,6 +2951,13 @@ class IrregularGridPlotter:
                                       pred_len=None):
         """
         Plot prediction error heatmaps (prediction - ground truth) for a single forecast origin.
+
+        For one sample b (chosen in summer months), we build, for each variable:
+            - X-axis: forecast horizon index (T+1 ... T+H)
+            - Y-axis: depth
+            - Color: error (pred - GT)
+
+        We do NOT stack by day anymore; we only show a single prediction window.
         """
         # Handle predictions - extract mean if distribution dict
         if isinstance(preds_row, dict):
@@ -2017,6 +3003,7 @@ class IrregularGridPlotter:
             print("No valid data for selected summer sample")
             return
 
+        # Restrict to this sample and its valid tokens
         try:
             dts_b = pd.to_datetime(dt_array[b][sel])
         except Exception as e:
@@ -2038,15 +3025,18 @@ class IrregularGridPlotter:
         gt_sorted = gt_b[sort_idx]
         pred_sorted = pred_b[sort_idx]
 
+        # Choose variables to plot
         unique_vars = np.unique(var_ids_sorted)
         plot_vars = unique_vars[:max_features]
         if len(plot_vars) == 0:
             print("No valid variables to plot in error heatmap")
             return
 
+        # Figure out unique time steps (horizons) for this sample overall
         all_unique_times = np.unique(time_vals_sorted)
         all_unique_times_sorted = np.sort(all_unique_times)
 
+        # If pred_len is provided, clamp to at most pred_len horizons
         if pred_len is not None:
             all_unique_times_sorted = all_unique_times_sorted[:pred_len]
         H = len(all_unique_times_sorted)
@@ -2054,11 +3044,13 @@ class IrregularGridPlotter:
             print("No unique horizons found for error heatmap")
             return
 
+        # Create figure with one subplot per variable
         fig, axes = plt.subplots(len(plot_vars), 1, figsize=(16, 4 * len(plot_vars)), squeeze=False)
 
         for vi, var_id in enumerate(plot_vars):
             ax = axes[vi, 0]
 
+            # Filter data for this variable
             var_mask = (var_ids_sorted == var_id)
             if not var_mask.any():
                 continue
@@ -2069,21 +3061,28 @@ class IrregularGridPlotter:
             pred_v = pred_sorted[var_mask]
             errors_v = pred_v - gt_v
 
+            # Unique depths for this variable
             unique_depths_var = np.unique(depths_v)
             unique_depths_var = np.sort(unique_depths_var)[:max_depths]
             Dn = len(unique_depths_var)
             if Dn == 0:
                 continue
 
+            # Map horizons (time values) to column indices
             time_to_col = {t: j for j, t in enumerate(all_unique_times_sorted)}
 
+            # Initialize error matrix (depth × horizon)
             err_mat = np.full((Dn, H), np.nan, dtype=float)
+
+            # Fill matrix
             for t_val, d_val, e_val in zip(times_v, depths_v, errors_v):
+                # Find horizon index
                 if t_val in time_to_col:
                     h_idx = time_to_col[t_val]
                 else:
                     closest_idx = int(np.argmin(np.abs(all_unique_times_sorted - t_val)))
                     h_idx = closest_idx
+                # Find depth index
                 d_idx_arr = np.where(np.abs(unique_depths_var - d_val) < 1e-6)[0]
                 if d_idx_arr.size == 0:
                     continue
@@ -2091,6 +3090,7 @@ class IrregularGridPlotter:
                 if np.isnan(err_mat[d_idx, h_idx]):
                     err_mat[d_idx, h_idx] = e_val
 
+            # Plot heatmap
             cmap = plt.cm.get_cmap('RdBu_r').copy()
             cmap.set_bad(color='green')  # green = no data at that (depth, horizon)
             im = ax.imshow(err_mat,
@@ -2104,6 +3104,7 @@ class IrregularGridPlotter:
             ax.set_ylabel("Depth (m)")
             ax.set_xlabel("Prediction horizon (T+n)")
 
+            # Depth tick labels
             try:
                 if depth_min is not None and depth_max is not None:
                     depth_labels = [
@@ -2119,12 +3120,14 @@ class IrregularGridPlotter:
             ax.set_yticks(np.arange(Dn)[::depth_tick_step])
             ax.set_yticklabels([depth_labels[i] for i in range(0, Dn, depth_tick_step)])
 
+            # Horizon ticks: T+1 ... T+H, sub-sampled if long
             tick_step = max(1, H // 20)  # show ~20 ticks max
             x_ticks = np.arange(0, H, tick_step)
             x_labels = [f"T+{i+1}" for i in x_ticks]
             ax.set_xticks(x_ticks)
             ax.set_xticklabels(x_labels, rotation=0)
 
+            # Colorbar
             cbar = fig.colorbar(im, ax=ax, fraction=0.046, pad=0.04)
             cbar.set_label('Prediction Error (Pred - GT)', rotation=270, labelpad=20)
 
@@ -2132,6 +3135,7 @@ class IrregularGridPlotter:
         title = f'{title_prefix}: {train_or_val} Prediction Error Heatmaps at epoch {epoch}'
         plt.suptitle(title, fontsize=14, y=1.0)
 
+        # Save to disk if save_path is provided
         if save_path is not None:
             import os
             save_dir = os.path.dirname(save_path)
@@ -2140,6 +3144,7 @@ class IrregularGridPlotter:
             plt.savefig(save_path, dpi=180, bbox_inches='tight')
             print(f"Saved prediction error heatmap to {save_path}")
 
+        # Log to wandb
         wandb.log({title: wandb.Image(plt)})
         plt.close()
         return
@@ -2166,10 +3171,35 @@ class IrregularGridPlotter:
                                     save_path=None):
         """
         Plot T+n prediction errors (pred - gt) for a date range, showing specific horizons (T+1, T+7, T+14, T+30).
+        
+        For each horizon, creates a heatmap showing prediction errors across a date range:
+            - Rows: depths (one row per horizon)
+            - Columns: dates in the range
+            - Color: prediction error (pred - gt), using blue/white/red colormap
+        
+        Args:
+            preds_row: Predictions - dict with 'mean' or tensor of shape (B, S)
+            gt_row: Ground truth values - tensor of shape (B, S)
+            datetime_raw_vals: Raw datetime strings/objects of shape (B, S)
+            depth_vals_row: Depth values (B, S)
+            var_ids_row: Variable IDs (B, S)
+            mask_row: Valid token mask (B, S)
+            feature_dict: Mapping from variable ID to variable name
+            epoch: Current epoch (for logging, not shown in title)
+            train_or_val: 'train' or 'val'
+            var_name: Variable name to plot (if None, plots first available variable)
+            lake_name: Lake name to display in title (if None, not shown)
+            start_date: Start date for date range (str 'YYYY-MM-DD' or date object). If None, auto-selects.
+            end_date: End date for date range (str 'YYYY-MM-DD' or date object). If None, auto-selects.
+            horizons: List of horizon indices to plot (default: [1, 7, 14, 30] for T+1, T+7, T+14, T+30)
+            max_depths: Max number of depths to plot
+            depth_min/ depth_max: Optional depth de-normalization parameters.
+            save_path: Optional path to save the figure.
         """
         # Handle predictions - extract mean if distribution dict
         if isinstance(preds_row, dict):
             preds_mean = preds_row['mean'].detach().cpu().numpy()
+            # Extract std/scale if available
             if 'scale' in preds_row:
                 preds_std = preds_row['scale'].detach().cpu().numpy()
             elif 'std' in preds_row:
@@ -2194,6 +3224,7 @@ class IrregularGridPlotter:
         B = preds_mean.shape[0]
         valid_mask = mask.astype(bool)
 
+        # Check if datetime_raw_vals is valid
         if datetime_raw_vals is None:
             print("No valid datetimes available for T+n predictions plot: datetime_raw_vals is None")
             return
@@ -2208,6 +3239,7 @@ class IrregularGridPlotter:
             print(f"No valid datetimes available for T+n predictions plot: datetime_raw_vals shape {dt_array.shape} doesn't match batch size {B}")
             return
 
+        # Find the sample with the most observations (most dense sample)
         sample_observation_counts = []
         for b in range(B):
             sel = valid_mask[b]
@@ -2218,10 +3250,12 @@ class IrregularGridPlotter:
             print("No valid observations found in any sample")
             return
         
+        # Select the batch with maximum observations
         selected_batch_idx = np.argmax(sample_observation_counts)
         max_observations = sample_observation_counts[selected_batch_idx]
         print(f"Selecting sample {selected_batch_idx} with {max_observations} observations (most dense)")
 
+        # Collect valid dates only from the selected batch to determine date range if not provided
         all_dates = []
         sel = valid_mask[selected_batch_idx]
         if sel.any():
@@ -2239,10 +3273,12 @@ class IrregularGridPlotter:
             print("No valid datetimes available for T+n predictions plot")
             return
 
+        # Determine date range
         all_dates_series = pd.Series(all_dates)
         unique_dates = sorted(all_dates_series.unique())
         
         if start_date is None:
+            # Default: prefer summer months (May-June)
             summer_dates = [d for d in unique_dates if d.month in [5, 6]]
             if len(summer_dates) > 0:
                 start_date = min(summer_dates)
@@ -2257,11 +3293,14 @@ class IrregularGridPlotter:
             return
         
         if end_date is None:
+            # Default: 30 days after start_date, but use actual available dates
             target_end = start_date + pd.Timedelta(days=30)
+            # Find the closest available date <= target_end
             available_after_start = [d for d in unique_dates if d >= start_date and d <= target_end]
             if len(available_after_start) > 0:
                 end_date = max(available_after_start)
             else:
+                # If no dates in range, use the next available date after start
                 dates_after = [d for d in unique_dates if d > start_date]
                 if len(dates_after) > 0:
                     end_date = min(dates_after)
@@ -2273,6 +3312,7 @@ class IrregularGridPlotter:
 
         print(f"T+n predictions: date range {start_date} to {end_date}, horizons {horizons}")
 
+        # Find variable ID if var_name is provided
         target_var_id = None
         if var_name is not None:
             for vid, vname in feature_dict.items():
@@ -2281,18 +3321,25 @@ class IrregularGridPlotter:
                     break
             if target_var_id is None:
                 print(f"Variable '{var_name}' not found in feature_dict. Available: {list(feature_dict.values())}")
+                # Use first available variable
                 target_var_id = list(feature_dict.keys())[0] if len(feature_dict) > 0 else None
         else:
+            # Use first available variable
             target_var_id = list(feature_dict.keys())[0] if len(feature_dict) > 0 else None
 
         if target_var_id is None:
             print("No variables available to plot")
             return
 
-        horizon_data = {h: [] for h in horizons}
+        # Collect predictions and errors: for each horizon, collect (date, depth, pred_val, gt_val, error, std_val)
+        horizon_data = {h: [] for h in horizons}  # horizon -> list of (date, depth, pred_val, gt_val, error, std_val)
         
+        # Collect all unique depths from all data (not just in date range) for complete grid
         all_depths_all_data = set()
         
+        # Process only the selected batch (most dense sample)
+        # Structure: (var1, depth1, time1), (var1, depth1, time2), ..., (var1, depth2, time1), ...
+        # Position in sequence = horizon (0 = T+1, 1 = T+2, etc.)
         b = selected_batch_idx
         sel = valid_mask[b]
         if not sel.any():
@@ -2322,6 +3369,7 @@ class IrregularGridPlotter:
         else:
             batch_std = None
         
+        # Group by (var, depth) and sort by time within each group
         var_depth_groups = {}
         for idx in range(len(dates_b)):
             var_id = int(batch_vars[idx])
@@ -2332,6 +3380,7 @@ class IrregularGridPlotter:
             if key not in var_depth_groups:
                 var_depth_groups[key] = []
             
+            # Get datetime for sorting
             if hasattr(dts_b, 'iloc'):
                 dt_val = dts_b.iloc[idx]
             elif isinstance(dts_b, pd.DatetimeIndex):
@@ -2347,14 +3396,19 @@ class IrregularGridPlotter:
                 'std': batch_std[idx] if batch_std is not None else None
             })
         
+        # For each (var, depth) group, sort by datetime to get temporal sequence
+        # Position in sequence = horizon (0 = T+1, 1 = T+2, etc.)
         for (var_id, depth_val), group_data in var_depth_groups.items():
             if var_id != target_var_id:
                 continue
             
+            # Track depths for target variable (for complete grid)
             all_depths_all_data.add(depth_val)
             
+            # Sort by datetime
             group_data_sorted = sorted(group_data, key=lambda x: x['datetime'])
             
+            # For each horizon T+n, extract position (n-1) from this batch
             for horizon in horizons:
                 pos_in_sequence = horizon - 1  # T+1 -> position 0, T+7 -> position 6, etc.
                 
@@ -2373,10 +3427,12 @@ class IrregularGridPlotter:
                     
                     horizon_data[horizon].append((date_val, depth_val, pred_val, gt_val, error_val, std_val))
 
+        # Generate full date range (all dates from start_date to end_date)
         date_range = pd.date_range(start=start_date, end=end_date, freq='D')
         sorted_dates = [d.date() for d in date_range]
         Dt = len(sorted_dates)
         
+        # Get all unique depths from data (limit to max_depths)
         sorted_depths = sorted(all_depths_all_data)[:max_depths]
         Dn = len(sorted_depths)
         
@@ -2384,10 +3440,12 @@ class IrregularGridPlotter:
             print("No depths found in data")
             return
         
+        # Check if we have any data at all
         total_records = sum(len(records) for records in horizon_data.values())
         if total_records == 0 and Dt == 0:
             return
 
+        # Create figure with subplots for each horizon (2 columns: error | std)
         num_horizons = len(horizons)
         fig, axes = plt.subplots(num_horizons, 2, figsize=(32, 4 * num_horizons), squeeze=False)
 
@@ -2396,8 +3454,11 @@ class IrregularGridPlotter:
         for hi, horizon in enumerate(sorted(horizons)):
             records = horizon_data[horizon]
             
+            # Build matrices: rows=depths, columns=dates
+            # Error matrix
             error_sum_mat = np.zeros((Dn, Dt), dtype=float)
             error_count_mat = np.zeros((Dn, Dt), dtype=float)
+            # Std matrix
             std_sum_mat = np.zeros((Dn, Dt), dtype=float)
             std_count_mat = np.zeros((Dn, Dt), dtype=float)
 
@@ -2405,9 +3466,11 @@ class IrregularGridPlotter:
                 if len(record) == 6:
                     date_val, depth_val, pred_val, gt_val, error_val, std_val = record
                 else:
+                    # Backward compatibility
                     date_val, depth_val, pred_val, gt_val, error_val = record[:5]
                     std_val = record[5] if len(record) > 5 else None
                 
+                # Find depth index
                 depth_idx = None
                 for di, d in enumerate(sorted_depths):
                     if abs(d - depth_val) < 1e-6:
@@ -2416,9 +3479,11 @@ class IrregularGridPlotter:
                 if depth_idx is None:
                     continue
                 
+                # Find date index (should be in sorted_dates which is the full range)
                 try:
                     date_idx = sorted_dates.index(date_val)
                 except ValueError:
+                    # Date not in range, skip
                     continue
                 
                 error_sum_mat[depth_idx, date_idx] += error_val
@@ -2428,14 +3493,17 @@ class IrregularGridPlotter:
                     std_sum_mat[depth_idx, date_idx] += std_val
                     std_count_mat[depth_idx, date_idx] += 1.0
 
+            # Compute mean error and std
             with np.errstate(invalid="ignore", divide="ignore"):
                 error_mat = np.where(error_count_mat > 0, error_sum_mat / error_count_mat, np.nan)
                 std_mat = np.where(std_count_mat > 0, std_sum_mat / std_count_mat, np.nan) if preds_std is not None else np.full((Dn, Dt), np.nan)
 
+            # Plot Error heatmap (left column)
             ax_error = axes[hi, 0]
             cmap_error = plt.cm.get_cmap('RdBu_r').copy()  # Red-Blue reversed
             cmap_error.set_bad(color='green')  # green = no data
             
+            # Determine symmetric color scale centered at 0
             vmax_error = np.nanmax(np.abs(error_mat)) if not np.isnan(error_mat).all() else 1.0
             vmin_error = -vmax_error if vmax_error > 0 else -1.0
             
@@ -2451,6 +3519,7 @@ class IrregularGridPlotter:
             ax_error.set_ylabel("Depth (m)")
             ax_error.set_xlabel("Date")
 
+            # Depth tick labels
             try:
                 if depth_min is not None and depth_max is not None:
                     depth_labels = [
@@ -2466,15 +3535,18 @@ class IrregularGridPlotter:
             ax_error.set_yticks(np.arange(Dn)[::depth_tick_step])
             ax_error.set_yticklabels([depth_labels[i] for i in range(0, Dn, depth_tick_step)])
 
+            # Date tick labels
             date_tick_step = max(1, Dt // 15)  # show ~15 date ticks max
             date_ticks = np.arange(0, Dt, date_tick_step)
             date_labels = [sorted_dates[i].strftime('%Y-%m-%d') for i in date_ticks]
             ax_error.set_xticks(date_ticks)
             ax_error.set_xticklabels(date_labels, rotation=45, ha='right')
 
+            # Colorbar for error
             cbar_error = fig.colorbar(im_error, ax=ax_error, fraction=0.046, pad=0.04)
             cbar_error.set_label('Error (Pred - GT)', rotation=270, labelpad=20)
 
+            # Plot Std heatmap (right column)
             ax_std = axes[hi, 1]
             if preds_std is not None and not np.isnan(std_mat).all():
                 cmap_std = plt.cm.get_cmap('viridis').copy()
@@ -2495,11 +3567,13 @@ class IrregularGridPlotter:
                 ax_std.set_ylabel("Depth (m)")
                 ax_std.set_xlabel("Date")
                 
+                # Same depth and date labels
                 ax_std.set_yticks(np.arange(Dn)[::depth_tick_step])
                 ax_std.set_yticklabels([depth_labels[i] for i in range(0, Dn, depth_tick_step)])
                 ax_std.set_xticks(date_ticks)
                 ax_std.set_xticklabels(date_labels, rotation=45, ha='right')
                 
+                # Colorbar for std
                 cbar_std = fig.colorbar(im_std, ax=ax_std, fraction=0.046, pad=0.04)
                 cbar_std.set_label('Std', rotation=270, labelpad=20)
             else:
@@ -2510,12 +3584,14 @@ class IrregularGridPlotter:
                 ax_std.set_xlabel("Date")
 
         plt.tight_layout()
+        # Title: just lake name if provided, otherwise variable name
         if lake_name is not None:
             title = str(lake_name)
         else:
             title = var_display_name
         plt.suptitle(title, fontsize=14, y=1.0)
 
+        # Save to disk if save_path is provided
         if save_path is not None:
             import os
             save_dir = os.path.dirname(save_path)
@@ -2553,7 +3629,23 @@ class SpatioTemporalHeatmapPlotter:
         """
         Plot spatio-temporal heatmaps for ground truth and predictions
         
+        Args:
+            gt_data: Ground truth data (B, T, D) or (B, T*D) 
+            pred_data: Prediction data (B, T, D) or (B, T*D) or dict with 'mean', 'loc', 'scale', 'df'
+            datetime_vals: Datetime values for x-axis (T,)
+            depth_vals: Depth values for y-axis (D,)
+            var_ids: Variable IDs (B, T, D) or (B, T*D)
+            masks: Validity masks (B, T, D) or (B, T*D)
+            feature_dict: Mapping from var_id to variable name
+            sample_idx: Sample indices to plot
+            epoch: Current epoch
+            train_or_val: 'train' or 'val'
+            title_prefix: Title prefix
+            max_features: Maximum number of features to plot
+            confidence_level: Confidence level for uncertainty bands
+            depth_units: Units for depth axis
         """
+        # Handle different input shapes
         if len(gt_data.shape) == 3:  # (B, T, D)
             B, T, D = gt_data.shape
             gt_flat = gt_data.view(B, -1)
@@ -2662,6 +3754,32 @@ class SpatioTemporalHeatmapPlotter:
         wandb.log({title: wandb.Image(plt)})
         plt.close()
     
+    # def plot_heatmap_with_uncertainty(self,
+    #                                 gt_data, pred_data,
+    #                                 datetime_vals, depth_vals,
+    #                                 var_ids, masks,
+    #                                 feature_dict, sample_idx,
+    #                                 epoch, train_or_val,
+    #                                 title_prefix="Spatio-Temporal Forecast with Uncertainty",
+    #                                 max_features=6,
+    #                                 confidence_level=0.95,
+    #                                 depth_units="m"):
+    #     """
+    #     Plot spatio-temporal heatmaps with uncertainty bands
+    #     """
+    #     if not isinstance(pred_data, dict) or 'loc' not in pred_data:
+    #         # Fallback to regular heatmap if no uncertainty data
+    #         self.plot_heatmap_forecast(gt_data, pred_data, datetime_vals, depth_vals,
+    #                                  var_ids, masks, feature_dict, sample_idx,
+    #                                  epoch, train_or_val, title_prefix,
+    #                                  max_features, confidence_level, depth_units)
+    #         return
+        
+    #     # Similar to plot_heatmap_forecast but with uncertainty visualization
+    #     # This would show mean, lower bound, and upper bound heatmaps
+    #     # Implementation similar to above but with three heatmaps per variable
+    #     pass  # TODO: Implement uncertainty heatmaps
+    
     def plot_simple_heatmap(self, 
                            gt_data, pred_data, 
                            datetime_vals, depth_vals,
@@ -2673,11 +3791,28 @@ class SpatioTemporalHeatmapPlotter:
                            depth_units="m"):
         """
         Plot simple spatio-temporal heatmaps for regular grid data
+        
+        Args:
+            gt_data: Ground truth data (B, T, D, V) or (B, T*D*V)
+            pred_data: Prediction data (B, T, D, V) or (B, T*D*V)
+            datetime_vals: Datetime values for x-axis (T,)
+            depth_vals: Depth values for y-axis (D,)
+            var_ids: Variable IDs (V,)
+            masks: Validity masks (B, T, D, V) or (B, T*D*V)
+            feature_dict: Mapping from var_id to variable name
+            sample_idx: Sample indices to plot
+            epoch: Current epoch
+            train_or_val: 'train' or 'val'
+            title_prefix: Title prefix
+            max_features: Maximum number of features to plot
+            depth_units: Units for depth axis
         """
+        # Handle different input shapes
         if len(gt_data.shape) == 4:  # (B, T, D, V)
             B, T, D, V = gt_data.shape
         elif len(gt_data.shape) == 2:  # (B, T*D*V) - flattened
             B, TDV = gt_data.shape
+            # We need to reshape - this is more complex, let's assume 4D for now
             print(f"Warning: Expected 4D data but got 2D with shape {gt_data.shape}")
             return
         else:
@@ -2692,6 +3827,7 @@ class SpatioTemporalHeatmapPlotter:
             print("No valid variables found for heatmap plotting")
             return
         
+        # Limit number of features
         if len(unique_vars) > max_features:
             unique_vars = unique_vars[:max_features]
         
@@ -2704,22 +3840,27 @@ class SpatioTemporalHeatmapPlotter:
             var_id_int = int(var_id)
             var_name = feature_dict.get(var_id_int, f"Variable {var_id_int}")
             
+            # Find the variable index in the data
             var_idx = np.where(var_ids == var_id)[0]
             if len(var_idx) == 0:
                 continue
             var_idx = var_idx[0]
             
+            # Extract data for this variable across all samples
             gt_var = gt_data[:, :, :, var_idx]  # (B, T, D)
             pred_var = pred_data[:, :, :, var_idx]  # (B, T, D)
             mask_var = masks[:, :, :, var_idx]  # (B, T, D)
             
+            # Average across samples for visualization
             gt_mean = np.nanmean(gt_var, axis=0)  # (T, D)
             pred_mean = np.nanmean(pred_var, axis=0)  # (T, D)
             mask_mean = np.any(mask_var, axis=0)  # (T, D)
             
+            # Apply mask
             gt_mean[~mask_mean] = np.nan
             pred_mean[~mask_mean] = np.nan
             
+            # Plot ground truth heatmap
             ax_gt = axes[0, i]
             im_gt = ax_gt.imshow(gt_mean.T, aspect='auto', origin='lower', 
                                extent=[0, len(datetime_vals)-1, depth_vals[0], depth_vals[-1]],
@@ -2732,6 +3873,7 @@ class SpatioTemporalHeatmapPlotter:
                                 rotation=45)
             plt.colorbar(im_gt, ax=ax_gt, label='Value')
             
+            # Plot prediction heatmap
             ax_pred = axes[1, i]
             im_pred = ax_pred.imshow(pred_mean.T, aspect='auto', origin='lower',
                                    extent=[0, len(datetime_vals)-1, depth_vals[0], depth_vals[-1]],
@@ -2744,6 +3886,7 @@ class SpatioTemporalHeatmapPlotter:
                                   rotation=45)
             plt.colorbar(im_pred, ax=ax_pred, label='Value')
         
+        # Remove empty subplots
         for i in range(n_vars, axes.shape[1]):
             for j in range(2):
                 axes[j, i].remove()
@@ -2779,13 +3922,33 @@ class SpatioTemporalHeatmapPlotter:
         Shows T+14, T+21, T+30 predictions side by side with uncertainty bands.
         Uses a fixed context length and shows how predictions change at different horizons.
         
+        Args:
+            gt_row: Ground truth values (B, S) where B=num_samples, S=seq_len
+            preds_row: Predictions - can be dict with distribution params or tensor (B, S)
+            time_vals_row: Time values (B, S)
+            datetime_raw_vals: Datetime strings/objects (B, S)
+            depth_vals_row: Depth values (B, S)
+            var_ids_row: Variable IDs (B, S)
+            mask_row: Valid token mask (B, S)
+            feature_dict: Mapping from variable ID to variable name
+            sample_idx: Index of sample to plot (single integer)
+            var_name: Variable name to plot (if None, uses first available)
+            target_depth: Target depth to plot (default: 0.0)
+            context_len: Length of context window (if None, inferred from data)
+            prediction_lengths: List of horizons to plot (default: [14, 21, 30])
+            confidence_level: Confidence level for uncertainty bands
+            epoch: Current epoch (for title/logging)
+            train_or_val: 'train' or 'val' (for title/logging)
+            lake_name: Lake name for title
+            save_path: Optional path to save the figure
         """
+        # Handle predictions - extract mean and distribution params if available
         if isinstance(preds_row, dict):
             has_distribution = True
             preds_mean = preds_row['mean'].detach().cpu().numpy()
             preds_loc = preds_row['loc'].detach().cpu().numpy()
             preds_scale = preds_row['scale'].detach().cpu().numpy()
-            preds_df = preds_row['df'].detach().cpu().numpy()
+            preds_df = preds_row['df'].detach().cpu().numpy() if ('df' in preds_row and preds_row['df'] is not None) else None
         else:
             has_distribution = False
             preds_mean = preds_row.detach().cpu().numpy() if hasattr(preds_row, 'detach') else np.asarray(preds_row)
@@ -2805,6 +3968,7 @@ class SpatioTemporalHeatmapPlotter:
             print(f"No valid data for sample {sample_idx}")
             return
         
+        # Extract data for valid tokens
         sample_gt = gt[sample_idx, valid_idx]
         sample_preds = preds_mean[sample_idx, valid_idx]
         sample_depths = depth_vals[sample_idx, valid_idx]
@@ -2816,6 +3980,7 @@ class SpatioTemporalHeatmapPlotter:
             sample_scale = preds_scale[sample_idx, valid_idx]
             sample_df = preds_df[sample_idx, valid_idx]
         
+        # Find variable ID
         target_var_id = None
         if var_name is not None:
             for vid, vname in feature_dict.items():
@@ -2827,6 +3992,7 @@ class SpatioTemporalHeatmapPlotter:
             unique_vars = np.unique(sample_vars)
             target_var_id = int(unique_vars[0])
         
+        # Filter by target variable and depth
         var_mask = sample_vars == target_var_id
         depth_mask = np.abs(sample_depths - target_depth) < 0.1
         combined_mask = var_mask & depth_mask
@@ -2835,6 +4001,7 @@ class SpatioTemporalHeatmapPlotter:
             print(f"No data for variable {target_var_id} at depth {target_depth}")
             return
         
+        # Extract filtered data
         dts_raw = sample_datetimes[combined_mask]
         gt_filtered = sample_gt[combined_mask]
         preds_filtered = sample_preds[combined_mask]
@@ -2844,6 +4011,7 @@ class SpatioTemporalHeatmapPlotter:
             scale_filtered = sample_scale[combined_mask]
             df_filtered = sample_df[combined_mask]
         
+        # Convert datetimes to pandas datetime for sorting
         try:
             dts = pd.to_datetime(dts_raw)
             if isinstance(dts, pd.DatetimeIndex):
@@ -2854,6 +4022,7 @@ class SpatioTemporalHeatmapPlotter:
             print("Error parsing datetimes")
             return
         
+        # Sort by datetime to get temporal sequence
         order = np.argsort(dts.values)
         dates_plot = dts_series.iloc[order].dt.date.values if hasattr(dts_series, 'iloc') else pd.Series(dts)[order].dt.date.values
         gt_sorted = gt_filtered[order]
@@ -2866,6 +4035,7 @@ class SpatioTemporalHeatmapPlotter:
         
         # Determine context length
         if context_len is None:
+            # Assume first half is context, second half is prediction
             context_len = len(gt_sorted) // 2
         
         context_end_idx = min(context_len, len(gt_sorted))
@@ -2884,6 +4054,7 @@ class SpatioTemporalHeatmapPlotter:
             scale_pred = scale_sorted[context_end_idx:]
             df_pred = df_sorted[context_end_idx:]
         
+        # Create figure with subplots in a single row
         num_horizons = len(prediction_lengths)
         fig, axes = plt.subplots(1, num_horizons, figsize=(6 * num_horizons, 6))
         if num_horizons == 1:
@@ -2894,6 +4065,7 @@ class SpatioTemporalHeatmapPlotter:
         for hi, horizon in enumerate(sorted(prediction_lengths)):
             ax = axes[hi]
             
+            # Position in prediction window = horizon - 1 (T+14 -> position 13, T+21 -> position 20, etc.)
             pos_in_pred_window = horizon - 1
             
             if pos_in_pred_window >= len(preds_pred):
@@ -2904,58 +4076,74 @@ class SpatioTemporalHeatmapPlotter:
                 ax.set_ylabel(var_display_name, fontsize=12)
                 continue
             
+            # Plot full context window (GT) - irregular sequence
             ax.plot(dates_context, gt_context, 'o-', color='blue', linewidth=2, 
                    markersize=8, alpha=0.7, label='Context (GT)', zorder=1)
             
+            # Plot full prediction window GT (for reference) - irregular sequence
             ax.plot(dates_pred, gt_pred, 's-', color='lightblue', linewidth=1.5, 
                    markersize=8, alpha=0.5, label='Prediction Window (GT)', zorder=1)
             
+            # Plot prediction at this specific horizon
             pred_date = dates_pred[pos_in_pred_window]
             pred_val = preds_pred[pos_in_pred_window]
             gt_val_at_horizon = gt_pred[pos_in_pred_window]
             
+            # Plot prediction point (larger, more prominent)
             ax.plot(pred_date, pred_val, 'o', color='red', markersize=12, 
                    label=f'T+{horizon} Prediction', zorder=3, markeredgecolor='darkred', markeredgewidth=2)
             ax.plot(pred_date, gt_val_at_horizon, 's', color='green', markersize=12, 
                    label=f'T+{horizon} GT', zorder=3, markeredgecolor='darkgreen', markeredgewidth=2)
             
+            # Plot uncertainty band if available
             if has_distribution and pos_in_pred_window < len(loc_pred):
                 loc_val = loc_pred[pos_in_pred_window]
                 scale_val = scale_pred[pos_in_pred_window]
                 df_val = df_pred[pos_in_pred_window]
                 
+                # Compute confidence interval
                 alpha = 1 - confidence_level
-                t_dist = stats.t(df=df_val, loc=loc_val, scale=scale_val)
-                lower = t_dist.ppf(alpha / 2)
-                upper = t_dist.ppf(1 - alpha / 2)
+                if df_val is None:
+                    t_dist = stats.norm(loc=loc_val, scale=scale_val)
+                else:
+                    t_dist = stats.t(df=df_val, loc=loc_val, scale=scale_val)
+                    lower = t_dist.ppf(alpha / 2)
+                    upper = t_dist.ppf(1 - alpha / 2)
                 
+                # Plot uncertainty band as vertical error bar
                 ax.errorbar(pred_date, pred_val, yerr=[[pred_val - lower], [upper - pred_val]], 
                            fmt='none', color='red', linewidth=3, capsize=8, capthick=2,
                            alpha=0.7, label=f'{int(confidence_level*100)}% CI', zorder=2)
+                # Also fill between for visibility
                 ax.fill_between([pred_date, pred_date], [lower, upper], 
                                color='red', alpha=0.2, zorder=2)
             
+            # Draw vertical dotted line at context/prediction boundary
             if context_end_idx > 0 and context_end_idx < len(dates_plot):
                 boundary_date = dates_plot[context_end_idx - 1]
                 ax.axvline(x=boundary_date, color='black', linestyle='--', linewidth=2, 
                           alpha=0.7, zorder=2)
+                # Add label only for first subplot
                 if hi == 0:
                     ax.text(boundary_date, ax.get_ylim()[1] * 0.95, 'Context/Prediction\nBoundary',
                            rotation=90, verticalalignment='top', fontsize=9, alpha=0.7,
                            bbox=dict(boxstyle='round', facecolor='white', alpha=0.8))
             
+            # Set labels and title
             ax.set_ylabel(f'{var_display_name}', fontsize=12)
             ax.set_xlabel('Date', fontsize=12)
             ax.set_title(f"T+{horizon}", fontsize=14, fontweight='bold')
             ax.legend(loc='best', fontsize=9, framealpha=0.9, ncol=1)
             ax.grid(True, alpha=0.3, linestyle='--', linewidth=0.5)
             
+            # Format x-axis
             ax.tick_params(axis='x', rotation=45)
             if len(dates_plot) > 30:
                 ax.xaxis.set_major_locator(plt.MaxNLocator(10))
         
         plt.tight_layout()
         
+        # Title
         title_parts = [f'Prediction Length Comparison: {var_display_name}']
         if target_depth is not None:
             title_parts.append(f'@ depth {target_depth:.2f}')
@@ -2964,6 +4152,7 @@ class SpatioTemporalHeatmapPlotter:
         title = ' - '.join(title_parts)
         plt.suptitle(title, fontsize=16, fontweight='bold', y=1.02)
         
+        # Save to disk if save_path is provided
         if save_path is not None:
             import os
             save_dir = os.path.dirname(save_path)
@@ -2972,6 +4161,7 @@ class SpatioTemporalHeatmapPlotter:
             plt.savefig(save_path, dpi=180, bbox_inches='tight')
             print(f"Saved prediction lengths comparison to {save_path}")
         
+        # Log to wandb
         if epoch is not None and train_or_val is not None:
             wandb_title = f'Prediction Lengths Comparison ({var_display_name}): {train_or_val} epoch {epoch}'
             wandb.log({wandb_title: wandb.Image(plt)})

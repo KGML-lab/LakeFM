@@ -112,6 +112,7 @@ class BaseLakeBuilder():
             overrides["mask_var_across_depths"] = getattr(root_cfg, "mask_var_across_depths", False)
             overrides["mask_depth_for_all_vars"] = getattr(root_cfg, "mask_depth_across_variables", False)
             overrides["eval_time_grid"] = getattr(root_cfg, "eval_time_grid", "regular")
+            overrides["scaling"] = getattr(root_cfg.trainer, "scaling", True)
             
             if hasattr(root_cfg, "window"):
                 overrides["dynamic_windows"] = root_cfg.window.dynamic_windows
