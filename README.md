@@ -86,11 +86,11 @@ For using any of the data and/or ckpt, add them to the corresponding dir (mentio
 
 3. LakeBeD dataset [Download](https://drive.google.com/file/d/10OzRxqh0RIrM7XMFY7wvlYT36uIGMjnZ/view?usp=drive_link) (`/resources/lakefm/data/LakeBeD-US`)
 
-4. EuroLakes data (download instructions pending) (`/resources/lakefm/data/newlakes/standardized`)
+4. EuroLakes data [Download](https://drive.google.com/file/d/1KYcfecInF2JE2ZfC55y85LRhb-T_jcRx/view?usp=sharing) (`/resources/lakefm/data/newlakes/standardized`)
 
 Checkpoints:
 
-- LakeFM 7M (download link pending): `resources/lakefm/dev/pretrain_ckpts/lakefm7m.pth`
+- LakeFM 7M [Download](https://drive.google.com/file/d/1pMB6F1J_tPoFUaiF8triUdWKaUgFpq9I/view?usp=sharing): `resources/lakefm/dev/pretrain_ckpts/lakefm7m.pth`
 - LakeFM 5M [Download](https://drive.google.com/file/d/1YDlnLUG37rOfV-yr8dfOj4UXFNSj2QAB/view?usp=drive_link): `resources/lakefm/dev/pretrain_ckpts/lakefm5m.pth`
 
 ---
