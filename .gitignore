@@ -2,3 +2,5 @@
 *wandb
 *output
 *.lock
+resources/lakefm/dev/norm_stats/lakefm7m/FcrSimPhy_*
+resources/lakefm/dev/norm_stats/lakefm7m/WQHansonSim_*
